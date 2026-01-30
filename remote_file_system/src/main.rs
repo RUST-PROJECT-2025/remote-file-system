@@ -2,10 +2,10 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyDirectory, ReplyEntry, ReplyOpen,
     ReplyWrite, ReplyCreate, ReplyEmpty, ReplyData, Request,
 };
-use libc::{EBADF, ENOENT, EIO};
-use log::{info, error};
+use libc::{EBADF, ENOENT, EIO, ENOSYS}; // Aggiunto ENOSYS
+use log::{info, error, warn}; // Aggiunto warn
 use std::{
-    collections::HashMap, ffi::OsStr, time::Duration, path::PathBuf,
+    collections::HashMap, ffi::OsStr, time::{Duration, SystemTime}, path::PathBuf,
     sync::atomic::{AtomicU64, Ordering}
 };
 use shared::file_entry::FileEntry;
@@ -63,13 +63,16 @@ impl RemoteFS {
 }
 
 impl Filesystem for RemoteFS {
-    // METADATA
+    // --- METADATA ---
+
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        // Controllo se il file è aperto e ha dati in buffer non ancora salvati
         if let Some(rfs_file) = self.rfs_files.get(&Inode(ino)) {
-            // Se il file è aperto e modificato localmente, restituisci la size del buffer
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
                 let mut attr = FileAttrWrapper::from(rfs_file.file_entry.clone()).0;
                 attr.size = rfs_file.write_buffer.as_ref().unwrap().len() as u64;
+                // Aggiorniamo timestamp alla data corrente per simulare modifica
+                attr.mtime = SystemTime::now(); 
                 reply.attr(&TTL, &attr);
                 return;
             }
@@ -81,13 +84,56 @@ impl Filesystem for RemoteFS {
         }
     }
 
+    // NUOVO: Implementazione fondamentale per cp, chmod, truncate
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let inode = Inode(ino);
+        
+        // Gestione cambio dimensione (truncate)
+        if let Some(new_size) = size {
+            if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
+                if rfs_file.write_buffer.is_none() {
+                    rfs_file.write_buffer = Some(Vec::new());
+                }
+                let buf = rfs_file.write_buffer.as_mut().unwrap();
+                buf.resize(new_size as usize, 0);
+                rfs_file.is_dirty = true;
+                rfs_file.file_entry.size = new_size;
+            }
+        }
+
+        // Gestione permessi (chmod) - opzionale: chiamare API rename o update metadata
+        if let Some(_new_mode) = mode {
+             // Qui potresti chiamare una API sul server per cambiare permessi
+             // Per ora accettiamo la modifica silenziosamente per non rompere cp
+        }
+
+        // Ritorniamo gli attributi aggiornati
+        self.getattr(_req, ino, None, reply);
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_path = match self.get_path_str(Inode(parent)) {
             Some(p) => p,
             None => { reply.error(ENOENT); return; }
         };
         
-        // Refresh directory cache
         let _ = self.cache.list_dir(&parent_path);
 
         let target_name = name.to_string_lossy();
@@ -117,7 +163,8 @@ impl Filesystem for RemoteFS {
         }
     }
 
-    // CREAZIONE / RIMOZIONE
+    // --- CREAZIONE / RIMOZIONE ---
+
     fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
         let parent_path = match self.get_path_str(Inode(parent)) {
             Some(p) => p,
@@ -127,7 +174,7 @@ impl Filesystem for RemoteFS {
 
         match self.cache.api.create_directory(&new_path) {
             Ok(_) => {
-                let _ = self.cache.list_dir(&parent_path); // Refresh per ottenere INO
+                let _ = self.cache.list_dir(&parent_path); 
                 let target_path = PathBuf::from(new_path);
                 match self.cache.files.values().find(|f| f.file_path == target_path) {
                     Some(f) => reply.entry(&TTL, &FileAttrWrapper::from(f.file_entry.clone()).0, 0),
@@ -135,6 +182,32 @@ impl Filesystem for RemoteFS {
                 }
             },
             Err(_) => reply.error(EIO),
+        }
+    }
+
+    // NUOVO: Aggiunto mknod come fallback per create
+    fn mknod(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _rdev: u32, reply: ReplyEntry) {
+        // Implementazione semplificata: delega alla logica di creazione file (senza open)
+        // 1. Usa create per creare il file vuoto sul server
+        // 2. Ritorna l'entry senza aprirlo
+        
+        let parent_path = match self.get_path_str(Inode(parent)) {
+            Some(p) => p,
+            None => { reply.error(ENOENT); return; }
+        };
+        let new_path = PathBuf::from(&parent_path).join(name);
+        let new_path_str = new_path.to_string_lossy().to_string();
+
+        if self.cache.api.write_file(&new_path_str, vec![]).is_err() {
+            reply.error(EIO); return;
+        }
+
+        let _ = self.cache.list_dir(&parent_path);
+        match self.cache.files.values().find(|f| f.file_path == new_path).cloned() {
+            Some(cached) => {
+                 reply.entry(&TTL, &FileAttrWrapper::from(cached.file_entry).0, 0);
+            },
+            None => reply.error(EIO),
         }
     }
 
@@ -159,7 +232,7 @@ impl Filesystem for RemoteFS {
                 let ino = Inode(cached.file_entry.ino);
                 let mut rfs_file = RfsFile::from(cached);
                 rfs_file.fds.insert(fd, OpenedFile { fd, ino, flags: OpenFlags::WRITE });
-                rfs_file.write_buffer = Some(Vec::new()); // Init buffer vuoto
+                rfs_file.write_buffer = Some(Vec::new()); 
                 rfs_file.is_dirty = true;
                 
                 self.rfs_files.insert(ino, rfs_file.clone());
@@ -183,7 +256,7 @@ impl Filesystem for RemoteFS {
     }
 
     fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink(req, parent, name, reply); // Stessa API per file e dir
+        self.unlink(req, parent, name, reply); 
     }
 
     fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {
@@ -200,7 +273,8 @@ impl Filesystem for RemoteFS {
         }
     }
 
-    // IO
+    // --- IO ---
+
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let inode = Inode(ino);
         if let Some(cached) = self.cache.get_file_by_ino(inode) {
@@ -210,11 +284,7 @@ impl Filesystem for RemoteFS {
             let rfs_file = self.rfs_files.entry(inode).or_insert(RfsFile::from(cached));
             rfs_file.fds.insert(fd, OpenedFile { fd, ino: inode, flags: open_flags });
 
-            // Se apre in scrittura e non abbiamo buffer, scarica file per modificarlo (semplificato: crea buffer vuoto se trunc, altrimenti TODO load)
-            // Qui assumiamo che WRITE parta da zero o che gestiamo l'append. Per semplicità: init buffer vuoto se non c'è.
             if open_flags.is_write() && rfs_file.write_buffer.is_none() {
-                // In un caso reale dovremmo scaricare il contenuto attuale per non sovrascriverlo parzialmente
-                // Per ora inizializziamo vuoto (comportamento simil O_TRUNC)
                  rfs_file.write_buffer = Some(Vec::new());
             }
 
@@ -226,7 +296,6 @@ impl Filesystem for RemoteFS {
 
     fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
         let inode = Inode(ino);
-        // Se c'è un buffer sporco locale, leggi da lì
         if let Some(f) = self.rfs_files.get(&inode) {
             if f.is_dirty && f.write_buffer.is_some() {
                 let buf = f.write_buffer.as_ref().unwrap();
@@ -238,7 +307,6 @@ impl Filesystem for RemoteFS {
             }
         }
         
-        // Altrimenti scarica dal server
         if let Some(f) = self.cache.get_file_by_ino(inode) {
             match self.cache.api.read_file_contents(f.file_path.to_str().unwrap(), offset as u64, size) {
                 Ok(data) => reply.data(&data),
@@ -259,7 +327,7 @@ impl Filesystem for RemoteFS {
             
             buf[offset as usize..end].copy_from_slice(data);
             rfs_file.is_dirty = true;
-            rfs_file.file_entry.size = buf.len() as u64; // Aggiorna size locale
+            rfs_file.file_entry.size = buf.len() as u64; 
             
             reply.written(data.len() as u32);
         } else {
@@ -289,7 +357,6 @@ impl Filesystem for RemoteFS {
         if let Some(rfs_file) = self.rfs_files.get_mut(&Inode(ino)) {
             rfs_file.fds.remove(&Fd(fh));
             if rfs_file.fds.is_empty() && !rfs_file.is_dirty {
-                // Cleanup memoria se non servono più
                 rfs_file.write_buffer = None;
             }
         }
