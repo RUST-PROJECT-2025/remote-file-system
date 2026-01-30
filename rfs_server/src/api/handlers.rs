@@ -76,8 +76,10 @@ pub async fn delete_file_or_directory(path: SafePath) -> Result<HttpResponse, ac
     let full_path = path.into_inner();
     if !full_path.exists() { return Ok(HttpResponse::NotFound().finish()); }
 
+    // MODIFICA: Usiamo remove_dir invece di remove_dir_all per le directory.
+    // Questo farà fallire la richiesta se la directory contiene file, come richiesto da rmdir.
     if fs::metadata(&full_path).await?.is_dir() {
-        fs::remove_dir_all(full_path).await
+        fs::remove_dir(full_path).await
     } else {
         fs::remove_file(full_path).await
     }.map_err(|e| ErrorInternalServerError(e))?;

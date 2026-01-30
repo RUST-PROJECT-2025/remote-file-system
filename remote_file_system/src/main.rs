@@ -200,16 +200,32 @@ impl Filesystem for RemoteFS {
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => { reply.error(ENOENT); return; }
         };
         let target = PathBuf::from(&parent_path).join(name).to_string_lossy().to_string();
+        
         match self.cache.api.delete_file_or_directory(&target) {
-            Ok(_) => reply.ok(), Err(_) => reply.error(EIO),
+            Ok(_) => reply.ok(),
+            Err(_) => reply.error(EIO),
         }
     }
 
-    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink(req, parent, name, reply); 
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let parent_path = match self.get_path_str(Inode(parent)) {
+            Some(p) => p,
+            None => { reply.error(ENOENT); return; }
+        };
+        let target = PathBuf::from(&parent_path).join(name).to_string_lossy().to_string();
+        
+        // rmdir deve fallire se la directory non è vuota.
+        // Se il server fallisce (perché ora usa remove_dir), ritorniamo ENOTEMPTY.
+        match self.cache.api.delete_file_or_directory(&target) {
+            Ok(_) => reply.ok(),
+            // Nota: In un'implementazione perfetta, l'API dovrebbe ritornare 409 Conflict
+            // e il client dovrebbe distinguere l'errore. Qui assumiamo che errore su rmdir = non vuota.
+            Err(_) => reply.error(libc::ENOTEMPTY), 
+        }
     }
 
     fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {
