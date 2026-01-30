@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, ops::BitOr};
+use std::{collections::HashMap, path::PathBuf};
 use shared::file_entry::FileEntry;
 use crate::{cache::{CachedFile, Inode}, Fd};
 
@@ -10,7 +10,6 @@ impl OpenFlags {
     pub const WRITE: OpenFlags = OpenFlags(2);
     
     pub fn from_flags(flags: i32) -> Self {
-        // Logica semplificata: se c'è WRONLY o RDWR, abilita WRITE
         let acc_mode = flags & libc::O_ACCMODE;
         if acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR {
             Self::WRITE
@@ -33,8 +32,14 @@ pub struct RfsFile {
     pub file_entry: FileEntry,
     pub file_path: PathBuf,
     pub fds: HashMap<Fd, OpenedFile>,
-    pub write_buffer: Option<Vec<u8>>, // Buffer per scritture (dirty state)
+    
+    // Buffer per SCRITTURA (Dirty state)
+    pub write_buffer: Option<Vec<u8>>, 
     pub is_dirty: bool,
+
+    // Buffer per LETTURA (Read Ahead Cache)
+    pub read_buffer: Vec<u8>,
+    pub read_buffer_offset: u64,
 }
 
 impl From<CachedFile> for RfsFile {
@@ -45,6 +50,9 @@ impl From<CachedFile> for RfsFile {
             fds: HashMap::new(),
             write_buffer: None,
             is_dirty: false,
+            // Inizializza buffer di lettura vuoto
+            read_buffer: Vec::new(),
+            read_buffer_offset: 0,
         }
     }
 }
