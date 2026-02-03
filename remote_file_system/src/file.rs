@@ -33,13 +33,16 @@ pub struct RfsFile {
     pub file_path: PathBuf,
     pub fds: HashMap<Fd, OpenedFile>,
     
-    // Buffer per SCRITTURA (Dirty state)
+    // Buffer per SCRITTURA
     pub write_buffer: Option<Vec<u8>>, 
     pub is_dirty: bool,
 
-    // Buffer per LETTURA (Read Ahead Cache)
+    // Buffer per LETTURA
     pub read_buffer: Vec<u8>,
     pub read_buffer_offset: u64,
+
+    // NUOVO: Flag per gestione unlink su file aperti
+    pub unlinked: bool,
 }
 
 impl From<CachedFile> for RfsFile {
@@ -50,9 +53,9 @@ impl From<CachedFile> for RfsFile {
             fds: HashMap::new(),
             write_buffer: None,
             is_dirty: false,
-            // Inizializza buffer di lettura vuoto
             read_buffer: Vec::new(),
             read_buffer_offset: 0,
+            unlinked: false, // Inizializza a false
         }
     }
 }

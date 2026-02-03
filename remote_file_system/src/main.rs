@@ -203,9 +203,54 @@ impl Filesystem for RemoteFS {
             Some(p) => p,
             None => { reply.error(ENOENT); return; }
         };
-        let target = PathBuf::from(&parent_path).join(name).to_string_lossy().to_string();
-        
-        match self.cache.api.delete_file_or_directory(&target) {
+        let target_path = PathBuf::from(&parent_path).join(name);
+        let target_path_str = target_path.to_string_lossy().to_string();
+
+        // 1. Cerchiamo l'inode del file target per vedere se è aperto localmente
+        //    (Dobbiamo cercarlo nella cache perché unlink ci da solo nome e parent)
+        let found_entry = self.cache.files.values().find(|f| f.file_path == target_path).cloned();
+
+        if let Some(cached) = found_entry {
+            let inode = Inode(cached.file_entry.ino);
+            
+            // 2. Controllo se il file è APERTO (è presente in rfs_files e ha file descriptor attivi)
+            let is_open = if let Some(rfs_file) = self.rfs_files.get(&inode) {
+                !rfs_file.fds.is_empty()
+            } else {
+                false
+            };
+
+            if is_open {
+                // CASO A: Il file è aperto. NON cancellare. Rinomina in un file nascosto.
+                let new_name = format!(".deleted_{}_{}", inode.0, name.to_string_lossy());
+                
+                info!("Unlink su file aperto (ino={}). Rinomino in {} per preservare lettura.", inode.0, new_name);
+
+                // Eseguiamo il rename sul server
+                match self.cache.api.rename(&target_path_str, &new_name) {
+                    Ok(_) => {
+                        // Aggiorniamo lo stato locale
+                        if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
+                            rfs_file.unlinked = true;
+                            // Aggiorniamo il path locale in modo che le future read/write puntino al file rinominato
+                            rfs_file.file_path = PathBuf::from(&parent_path).join(&new_name);
+                        }
+                        
+                        // Invalidiamo la cache della directory genitore così ls non mostra più il file originale
+                        let _ = self.cache.list_dir(&parent_path);
+                        reply.ok();
+                    },
+                    Err(e) => {
+                        error!("Fallito rename per soft-delete: {}", e);
+                        reply.error(EIO);
+                    }
+                }
+                return;
+            }
+        }
+
+        // CASO B: Il file non è aperto (o non trovato in cache locale). Cancellazione standard immediata.
+        match self.cache.api.delete_file_or_directory(&target_path_str) {
             Ok(_) => reply.ok(),
             Err(_) => reply.error(EIO),
         }
@@ -357,14 +402,40 @@ impl Filesystem for RemoteFS {
     }
 
     fn release(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _flags: i32, _lock: Option<u64>, _flush: bool, reply: ReplyEmpty) {
-        if let Some(rfs_file) = self.rfs_files.get_mut(&Inode(ino)) {
+        let inode = Inode(ino);
+        let mut should_delete = false;
+        let mut delete_path = String::new();
+
+        if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
+            // Rimuoviamo il File Descriptor
             rfs_file.fds.remove(&Fd(fh));
-            if rfs_file.fds.is_empty() && !rfs_file.is_dirty {
-                rfs_file.write_buffer = None;
-                // Opzionale: pulire anche il read_buffer per liberare RAM
-                rfs_file.read_buffer.clear(); 
+
+            // Se non ci sono più FD aperti...
+            if rfs_file.fds.is_empty() {
+                // Pulizia memoria buffer
+                if !rfs_file.is_dirty {
+                    rfs_file.write_buffer = None;
+                    rfs_file.read_buffer.clear();
+                }
+
+                // ... e il file era stato marcato come "unlinked" (cancellato mentre era aperto)
+                if rfs_file.unlinked {
+                    should_delete = true;
+                    delete_path = rfs_file.file_path.to_string_lossy().to_string();
+                }
             }
         }
+
+        // Eseguiamo la cancellazione ritardata (fuori dal borrow di rfs_files)
+        if should_delete {
+            info!("Chiusura finale file unlinked. Cancellazione fisica: {}", delete_path);
+            if let Err(e) = self.cache.api.delete_file_or_directory(&delete_path) {
+                error!("Errore cancellazione file ritardata: {}", e);
+            }
+            // Rimuoviamo definitivamente dalla mappa dei file aperti
+            self.rfs_files.remove(&inode);
+        }
+
         reply.ok();
     }
 }
