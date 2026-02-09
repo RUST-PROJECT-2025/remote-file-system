@@ -145,4 +145,9 @@ impl Cache {
         let mut cache = self.metadata.write().unwrap();
         cache.remove(&Inode(ino));
     }
+
+    pub fn get_file_path(&self, ino: u64) -> Option<String>{
+        let cache = self.metadata.read().unwrap();
+        cache.get(&Inode(ino)).map(|entry| entry.file_path.to_string_lossy().to_string())
+    }
 }

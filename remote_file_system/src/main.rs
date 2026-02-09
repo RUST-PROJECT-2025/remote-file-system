@@ -15,13 +15,10 @@ mod api;
 mod cache;
 mod file;
 
-use crate::{cache::{Cache, Inode}, file::{OpenFlags, OpenedFile, RfsFile}};
+use crate::{cache::{Cache, Inode}, file::{OpenFlags, OpenedFile, RfsFile, Fd}};
 
 const TTL: Duration = Duration::from_secs(1);
 const PREFETCH_SIZE: u32 = 5 * 1024 * 1024; // 5 MB Read Ahead
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Fd(pub u64);
 
 struct FileAttrWrapper(FileAttr);
 impl From<FileEntry> for FileAttrWrapper {
@@ -51,17 +48,22 @@ struct RemoteFS {
 impl RemoteFS {
     fn new() -> Self {
         Self {
-            cache: Cache::new(),
+            cache: Cache::new(TTL.as_secs()),
             rfs_files: HashMap::new(),
             last_fd: AtomicU64::new(10),
         }
     }
 
-    fn alloc_fd(&self) -> Fd { Fd(self.last_fd.fetch_add(1, Ordering::SeqCst)) }
+    fn alloc_fd(&self) -> Fd { 
+        Fd(self.last_fd.fetch_add(1, Ordering::SeqCst)) 
+    }
+
 
     fn get_path_str(&self, ino: Inode) -> Option<String> {
-        self.cache.get_file_by_ino(ino).map(|f| f.file_path.to_string_lossy().to_string())
-    }
+        // self.cache.get_file_by_ino(ino).map(|f| f.file_path.to_string_lossy().to_string())
+        let cache_lock = self.cache.metadata.read().unwrap();
+        cache_lock.get(&ino).map(|m| m.file_path.to_string_lossy().to_string())
+    } 
 }
 
 impl Filesystem for RemoteFS {
@@ -78,8 +80,9 @@ impl Filesystem for RemoteFS {
             }
         }
         
-        match self.cache.get_file_by_ino(Inode(ino)) {
-            Some(f) => reply.attr(&TTL, &FileAttrWrapper::from(f.file_entry).0),
+        let cache_lock = self.cache.metadata.read().unwrap();
+        match cache_lock.get(&Inode(ino)) {
+            Some(f) => reply.attr(&TTL, &FileAttrWrapper::from(f.file_entry.clone()).0),
             None => reply.error(ENOENT),
         }
     }
@@ -105,11 +108,19 @@ impl Filesystem for RemoteFS {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p, 
+            None => { reply.error(ENOENT); return; }
         };
         let _ = self.cache.list_dir(&parent_path);
         let target_path = PathBuf::from(&parent_path).join(name.to_string_lossy().as_ref());
-        match self.cache.files.values().find(|f| f.file_path == target_path) {
+        
+        // rilascia il lock
+        let entry = {
+            let cache_lock = self.cache.metadata.read().unwrap();
+            cache_lock.values().find(|f| f.file_path == target_path).cloned()
+        };
+
+        match entry {
             Some(f) => reply.entry(&TTL, &FileAttrWrapper::from(f.file_entry.clone()).0, 0),
             None => reply.error(ENOENT),
         }
@@ -142,7 +153,8 @@ impl Filesystem for RemoteFS {
             Ok(_) => {
                 let _ = self.cache.list_dir(&parent_path); 
                 let target_path = PathBuf::from(new_path);
-                match self.cache.files.values().find(|f| f.file_path == target_path) {
+                let cache_lock = self.cache.metadata.read().unwrap();
+                match cache_lock.values().find(|f| f.file_path == target_path) {
                     Some(f) => reply.entry(&TTL, &FileAttrWrapper::from(f.file_entry.clone()).0, 0),
                     None => reply.error(EIO),
                 }
@@ -171,7 +183,8 @@ impl Filesystem for RemoteFS {
 
         // 4. FIX: Ora confrontiamo direttamente con `new_path` (PathBuf).
         // La closure catturerà `new_path` per riferimento, senza consumarlo.
-        match self.cache.files.values().find(|f| f.file_path == new_path).cloned() {
+        let cache_lock = self.cache.metadata.read().unwrap();
+        match cache_lock.values().find(|f| f.file_path == new_path).cloned() {
             Some(cached) => reply.entry(&TTL, &FileAttrWrapper::from(cached.file_entry).0, 0),
             None => reply.error(EIO),
         }
@@ -183,7 +196,8 @@ impl Filesystem for RemoteFS {
         let new_path = PathBuf::from(&parent_path).join(name);
         if self.cache.api.write_file(&new_path.to_string_lossy(), vec![]).is_err() { reply.error(EIO); return; }
         let _ = self.cache.list_dir(&parent_path);
-        match self.cache.files.values().find(|f| f.file_path == new_path).cloned() {
+        let cache_lock = self.cache.metadata.read().unwrap();
+        match cache_lock.values().find(|f| f.file_path == new_path).cloned() {
             Some(cached) => {
                 let fd = self.alloc_fd();
                 let ino = Inode(cached.file_entry.ino);
@@ -208,7 +222,8 @@ impl Filesystem for RemoteFS {
 
         // 1. Cerchiamo l'inode del file target per vedere se è aperto localmente
         //    (Dobbiamo cercarlo nella cache perché unlink ci da solo nome e parent)
-        let found_entry = self.cache.files.values().find(|f| f.file_path == target_path).cloned();
+        let cache_lock = self.cache.metadata.read().unwrap();
+        let found_entry = cache_lock.values().find(|f| f.file_path == target_path).cloned();
 
         if let Some(cached) = found_entry {
             let inode = Inode(cached.file_entry.ino);
@@ -286,12 +301,21 @@ impl Filesystem for RemoteFS {
     // --- IO ---
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        
         let inode = Inode(ino);
-        if let Some(cached) = self.cache.get_file_by_ino(inode) {
+        let metadata = {
+            let cache_lock = self.cache.metadata.read().unwrap();
+            cache_lock.get(&inode).cloned()
+        };
+
+        if let Some(cached) = metadata {
             let fd = self.alloc_fd();
             let open_flags = OpenFlags::from_flags(flags);
-            let rfs_file = self.rfs_files.entry(inode).or_insert(RfsFile::from(cached));
+            
+            let rfs_file = self.rfs_files.entry(inode).or_insert_with(|| RfsFile::from(cached));
+            
             rfs_file.fds.insert(fd, OpenedFile { fd, ino: inode, flags: open_flags });
+            
             if open_flags.is_write() && rfs_file.write_buffer.is_none() {
                  rfs_file.write_buffer = Some(Vec::new());
             }
@@ -301,46 +325,55 @@ impl Filesystem for RemoteFS {
         }
     }
 
-    // *** LETTURA OTTIMIZZATA (BUFFERED) ***
+    // LETTURA OTTIMIZZATA (BUFFERED)
     fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
         let inode = Inode(ino);
         
-        // 1. Controllo Scrittura Locale (Priority)
+        // Controllo scrittura locale (priority)
+        // Se l'utente ha scritto qualcosa ma non ha ancora fatto flush, 
+        // dobbiamo leggere da qui, altrimenti vedrebbe i dati vecchi del server.
         if let Some(rfs_file) = self.rfs_files.get(&inode) {
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
                 let buf = rfs_file.write_buffer.as_ref().unwrap();
                 let start = offset as usize;
-                if start >= buf.len() { reply.data(&[]); return; }
+                if start >= buf.len() {
+                    reply.data(&[]);
+                    return;
+                }
                 let end = cmp::min(start + size as usize, buf.len());
                 reply.data(&buf[start..end]);
                 return;
             }
         }
 
-        // 2. Controllo Buffer di Lettura (Prefetching)
+        // Controllo Buffer di Lettura 
         // Dobbiamo ottenere mutable reference per aggiornare il buffer se necessario
         // Se il file non è in rfs_files (strano per una read), proviamo a ricaricarlo dalla cache
-        let rfs_file = match self.rfs_files.get_mut(&inode) {
-            Some(f) => f,
-            None => {
-                 // Fallback: load from cache metadata if not open? 
-                 // FUSE garantisce che open venga chiamato prima, ma se siamo qui, gestiamo l'errore o ricarichiamo.
-                 if let Some(cached) = self.cache.get_file_by_ino(inode) {
-                     self.rfs_files.insert(inode, RfsFile::from(cached));
-                     self.rfs_files.get_mut(&inode).unwrap()
-                 } else {
-                     reply.error(ENOENT);
-                     return;
-                 }
+        let rfs_file = if let Some(f) = self.rfs_files.get_mut(&inode) {
+            f
+        } else {
+            // Fallback: se open() non lo ha inserito (raro), lo carichiamo dalla cache
+            let metadata = {
+                let cache_lock = self.cache.metadata.read().unwrap();
+                cache_lock.get(&inode).cloned()
+            };
+
+            if let Some(m) = metadata {
+                self.rfs_files.insert(inode, RfsFile::from(m));
+                self.rfs_files.get_mut(&inode).unwrap()
+            } else {
+                reply.error(ENOENT);
+                return;
             }
         };
 
+        // gestione cache hit / miss 
         let req_start = offset as u64;
         let req_end = req_start + size as u64;
         let buf_start = rfs_file.read_buffer_offset;
         let buf_end = buf_start + rfs_file.read_buffer.len() as u64;
 
-        // Cache Hit?
+        // cache hit
         if req_start >= buf_start && req_end <= buf_end {
             let slice_start = (req_start - buf_start) as usize;
             let slice_end = (req_end - buf_start) as usize;
@@ -348,15 +381,16 @@ impl Filesystem for RemoteFS {
             return;
         }
 
-        // Cache Miss: Download Chunk (Prefetching)
+        // cache miss (bisogna scaricare dal server)
+        // Usiamo PREFETCH_SIZE per scaricare più dati del necessario e velocizzare le read sequenziali
         let fetch_size = cmp::max(size, PREFETCH_SIZE);
-        let path = rfs_file.file_path.to_str().unwrap().to_string(); // Clone path per borrow checker
+        let path_str = rfs_file.file_path.to_string_lossy().to_string();
 
-        info!("Cache miss ino={}, offset={}. Prefetching {} bytes...", ino, req_start, fetch_size);
+        info!("Read Cache Miss [ino: {}]. Fetching {} bytes at offset {}...", ino, fetch_size, req_start);
 
-        match self.cache.api.read_file_contents(&path, req_start, fetch_size) {
+        match self.cache.api.read_file_contents(&path_str, req_start, fetch_size) {
             Ok(data) => {
-                // Aggiorna buffer
+                // Aggiorniamo buffer
                 rfs_file.read_buffer = data;
                 rfs_file.read_buffer_offset = req_start;
                 
@@ -365,7 +399,10 @@ impl Filesystem for RemoteFS {
                 let slice_len = cmp::min(size as usize, available);
                 reply.data(&rfs_file.read_buffer[0..slice_len]);
             },
-            Err(_) => reply.error(EIO),
+            Err(e) => {
+                error!("Errore durante la lettura dal server: {}", e);
+                reply.error(EIO);
+            }
         }
     }
 

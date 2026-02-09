@@ -1,6 +1,9 @@
 use std::{collections::HashMap, path::PathBuf};
 use shared::file_entry::FileEntry;
-use crate::{cache::{CachedFile, Inode}, Fd};
+use crate::cache::{MetadataEntry, Inode};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Fd(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenFlags(i32);
@@ -33,29 +36,27 @@ pub struct RfsFile {
     pub file_path: PathBuf,
     pub fds: HashMap<Fd, OpenedFile>,
     
-    // Buffer per SCRITTURA
     pub write_buffer: Option<Vec<u8>>, 
     pub is_dirty: bool,
 
-    // Buffer per LETTURA
     pub read_buffer: Vec<u8>,
     pub read_buffer_offset: u64,
 
-    // NUOVO: Flag per gestione unlink su file aperti
+    // flag per gestione unlink su file aperti
     pub unlinked: bool,
 }
 
-impl From<CachedFile> for RfsFile {
-    fn from(c: CachedFile) -> Self {
+impl From<MetadataEntry> for RfsFile {
+    fn from(md: MetadataEntry) -> Self {
         Self {
-            file_entry: c.file_entry,
-            file_path: c.file_path,
+            file_entry: md.file_entry,
+            file_path: md.file_path,
             fds: HashMap::new(),
             write_buffer: None,
             is_dirty: false,
             read_buffer: Vec::new(),
             read_buffer_offset: 0,
-            unlinked: false, // Inizializza a false
+            unlinked: false,
         }
     }
 }
