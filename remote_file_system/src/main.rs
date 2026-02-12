@@ -17,7 +17,7 @@ mod file;
 
 use crate::{cache::{Cache, Inode}, file::{OpenFlags, OpenedFile, RfsFile, Fd}};
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(60);
 const PREFETCH_SIZE: u32 = 5 * 1024 * 1024; // 5 MB Read Ahead
 
 struct FileAttrWrapper(FileAttr);
@@ -324,7 +324,7 @@ impl Filesystem for RemoteFS {
             reply.error(ENOENT);
         }
     }
-
+    /*
     // LETTURA OTTIMIZZATA (BUFFERED)
     fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
         let inode = Inode(ino);
@@ -404,6 +404,55 @@ impl Filesystem for RemoteFS {
                 reply.error(EIO);
             }
         }
+    }*/
+
+    fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
+        let inode = Inode(ino);
+        let chunk_size = PREFETCH_SIZE as u64;
+        let chunk_idx = offset as u64 / chunk_size; // Quale blocco serve?
+        let offset_in_chunk = (offset as u64 % chunk_size) as usize;
+
+        // 1. Priorità Scrittura (rimane uguale a prima)
+        if let Some(rfs_file) = self.rfs_files.get(&inode) {
+            if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
+                // ... (stessa logica del tuo codice per il write_buffer) ...
+                return;
+            }
+        }
+
+        // 2. Recupero RfsFile (rimane uguale a prima)
+        let rfs_file = self.rfs_files.get_mut(&inode).expect("File non trovato");
+
+        // 3. LOGICA CHUNKED CACHE
+        // Controlliamo se il blocco che serve è già in memoria
+        if let Some(chunk_data) = rfs_file.read_cache.get(&chunk_idx) {
+            // CACHE HIT! Velocità GB/s
+            let end = cmp::min(offset_in_chunk + size as usize, chunk_data.len());
+            reply.data(&chunk_data[offset_in_chunk..end]);
+            return;
+        }
+
+        // 4. CACHE MISS
+        // Scarichiamo solo il blocco mancante
+        let fetch_start = chunk_idx * chunk_size;
+        let path_str = rfs_file.file_path.to_string_lossy().to_string();
+
+        info!("Cache Miss! Scarico blocco {} per ino {}", chunk_idx, ino);
+
+        match self.cache.api.read_file_contents(&path_str, fetch_start, chunk_size as u32) {
+            Ok(data) => {
+                // Inseriamo il blocco nella mappa (senza cancellare gli altri!)
+                rfs_file.read_cache.insert(chunk_idx, data.clone());
+                
+                // Rispondiamo con la parte richiesta
+                let end = cmp::min(offset_in_chunk + size as usize, data.len());
+                reply.data(&data[offset_in_chunk..end]);
+            },
+            Err(e) => {
+                error!("Errore API: {}", e);
+                reply.error(EIO);
+            }
+        }
     }
 
     fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], _wflags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
@@ -452,7 +501,7 @@ impl Filesystem for RemoteFS {
                 // Pulizia memoria buffer
                 if !rfs_file.is_dirty {
                     rfs_file.write_buffer = None;
-                    rfs_file.read_buffer.clear();
+                    // rfs_file.read_buffer.clear();
                 }
 
                 // ... e il file era stato marcato come "unlinked" (cancellato mentre era aperto)
