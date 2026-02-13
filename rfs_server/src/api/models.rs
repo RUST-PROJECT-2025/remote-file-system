@@ -1,4 +1,4 @@
-use actix_web::{FromRequest, HttpRequest, dev::Payload, error::{ErrorBadRequest, ErrorInternalServerError, ErrorNotFound}, http::Method, web};
+use actix_web::{FromRequest, HttpRequest, dev::Payload, error::{ErrorBadRequest, ErrorNotFound}, http::Method, web};
 use futures_util::future::{LocalBoxFuture, ready, FutureExt};
 use std::path::PathBuf;
 
