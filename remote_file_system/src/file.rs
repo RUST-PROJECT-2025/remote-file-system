@@ -1,4 +1,4 @@
-use std::{collections::HashMap, hash::Hash, path::PathBuf};
+use std::{collections::{HashMap, HashSet}, hash::Hash, path::PathBuf};
 use shared::file_entry::FileEntry;
 use crate::cache::{MetadataEntry, Inode};
 
@@ -37,10 +37,11 @@ pub struct RfsFile {
     pub fds: HashMap<Fd, OpenedFile>,
     
     pub write_buffer: Option<Vec<u8>>, 
+    pub dirty_chunks: HashSet<u64>,
     pub is_dirty: bool,
 
     //pub read_buffer: Vec<u8>,
-    pub read_cache: HashMap<u64, Vec<u8>>,
+    pub read_cache: HashMap<u64, Vec<u8>>, 
     pub read_buffer_offset: u64,
 
     // flag per gestione unlink su file aperti
@@ -54,6 +55,7 @@ impl From<MetadataEntry> for RfsFile {
             file_path: md.file_path,
             fds: HashMap::new(),
             write_buffer: None,
+            dirty_chunks: HashSet::new(),
             is_dirty: false,
             // read_buffer: Vec::new(),
             read_cache: HashMap::new(),

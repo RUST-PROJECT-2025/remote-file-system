@@ -58,12 +58,48 @@ impl RemoteFS {
         Fd(self.last_fd.fetch_add(1, Ordering::SeqCst)) 
     }
 
-
     fn get_path_str(&self, ino: Inode) -> Option<String> {
         // self.cache.get_file_by_ino(ino).map(|f| f.file_path.to_string_lossy().to_string())
         let cache_lock = self.cache.metadata.read().unwrap();
         cache_lock.get(&ino).map(|m| m.file_path.to_string_lossy().to_string())
     } 
+
+    fn upload_chunk(&mut self, ino: u64, chunk_idx: u64) {
+        let rfs_file = self.rfs_files.get_mut(&Inode(ino)).expect("File non trovato");
+        
+        if let Some(chunk_data) = rfs_file.read_cache.get(&chunk_idx) {
+            let path_str = rfs_file.file_path.to_string_lossy().to_string();
+            let offset = chunk_idx * PREFETCH_SIZE as u64;
+
+            info!("Streaming PATCH: Invio blocco {} (offset {}) per {}", chunk_idx, offset, path_str);
+
+            match self.cache.api.patch_file_contents(&path_str, offset, chunk_data.clone()) {
+                Ok(_) => {
+                    // Rimuoviamo l'indice dai blocchi "sporchi"
+                    rfs_file.dirty_chunks.remove(&chunk_idx);
+                    // Se non ci sono più blocchi da sincronizzare, il file è pulito
+                    if rfs_file.dirty_chunks.is_empty() {
+                        rfs_file.is_dirty = false;
+                    }
+                },
+                Err(e) => error!("Errore durante lo streaming upload: {}", e),
+            }
+        }
+    }
+
+    // Forza la sincronizzazione di tutti i blocchi ancora sporchi
+    fn sync_dirty_chunks(&mut self, ino: u64) {
+        // Estraiamo gli indici per evitare problemi di borrow checker
+        let indices: Vec<u64> = if let Some(f) = self.rfs_files.get(&Inode(ino)) {
+            f.dirty_chunks.iter().cloned().collect()
+        } else {
+            return;
+        };
+
+        for idx in indices {
+            self.upload_chunk(ino, idx);
+        }
+    }
 }
 
 impl Filesystem for RemoteFS {
@@ -189,6 +225,7 @@ impl Filesystem for RemoteFS {
             None => reply.error(EIO),
         }
     }
+
     fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
         let parent_path = match self.get_path_str(Inode(parent)) {
             Some(p) => p, None => { reply.error(ENOENT); return; }
@@ -412,39 +449,59 @@ impl Filesystem for RemoteFS {
         let chunk_idx = offset as u64 / chunk_size; // Quale blocco serve?
         let offset_in_chunk = (offset as u64 % chunk_size) as usize;
 
-        // 1. Priorità Scrittura (rimane uguale a prima)
         if let Some(rfs_file) = self.rfs_files.get(&inode) {
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
-                // ... (stessa logica del tuo codice per il write_buffer) ...
+                let buf = rfs_file.write_buffer.as_ref().unwrap();
+                let start = offset as usize;
+                if start >= buf.len() {
+                    reply.data(&[]);
+                    return;
+                }
+                let end = cmp::min(start + size as usize, buf.len());
+                reply.data(&buf[start..end]);
                 return;
             }
         }
 
         // 2. Recupero RfsFile (rimane uguale a prima)
-        let rfs_file = self.rfs_files.get_mut(&inode).expect("File non trovato");
+        let rfs_file = if let Some(f) = self.rfs_files.get_mut(&inode) {
+            f
+        } else {
+            // Fallback: se open() non lo ha inserito (raro), lo carichiamo dalla cache
+            let metadata = {
+                let cache_lock = self.cache.metadata.read().unwrap();
+                cache_lock.get(&inode).cloned()
+            };
 
-        // 3. LOGICA CHUNKED CACHE
-        // Controlliamo se il blocco che serve è già in memoria
+            if let Some(m) = metadata {
+                self.rfs_files.insert(inode, RfsFile::from(m));
+                self.rfs_files.get_mut(&inode).unwrap()
+            } else {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        // il blocco è già in memoria?
         if let Some(chunk_data) = rfs_file.read_cache.get(&chunk_idx) {
-            // CACHE HIT! Velocità GB/s
+            // cache hit
             let end = cmp::min(offset_in_chunk + size as usize, chunk_data.len());
             reply.data(&chunk_data[offset_in_chunk..end]);
             return;
         }
 
-        // 4. CACHE MISS
-        // Scarichiamo solo il blocco mancante
+        // cache miss
         let fetch_start = chunk_idx * chunk_size;
         let path_str = rfs_file.file_path.to_string_lossy().to_string();
 
-        info!("Cache Miss! Scarico blocco {} per ino {}", chunk_idx, ino);
+        info!("Cache Miss: scarico blocco {} per ino {}", chunk_idx, ino);
 
         match self.cache.api.read_file_contents(&path_str, fetch_start, chunk_size as u32) {
             Ok(data) => {
-                // Inseriamo il blocco nella mappa (senza cancellare gli altri!)
+                // inserisce nella cache
                 rfs_file.read_cache.insert(chunk_idx, data.clone());
                 
-                // Rispondiamo con la parte richiesta
+                // recupera il dato
                 let end = cmp::min(offset_in_chunk + size as usize, data.len());
                 reply.data(&data[offset_in_chunk..end]);
             },
@@ -455,6 +512,7 @@ impl Filesystem for RemoteFS {
         }
     }
 
+    /*
     fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], _wflags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
         if let Some(rfs_file) = self.rfs_files.get_mut(&Inode(ino)) {
             if rfs_file.write_buffer.is_none() { rfs_file.write_buffer = Some(Vec::new()); }
@@ -468,8 +526,38 @@ impl Filesystem for RemoteFS {
         } else {
             reply.error(EBADF);
         }
+    }*/
+
+        fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
+        let inode = Inode(ino);
+        let chunk_size = PREFETCH_SIZE as u64;
+        let chunk_idx = offset as u64 / chunk_size;
+        let offset_in_chunk = (offset as u64 % chunk_size) as usize;
+
+        let rfs_file = self.rfs_files.get_mut(&inode).expect("File non trovato");
+
+        // 1. Assicuriamoci che il blocco sia in cache (se non c'è, lo inizializziamo o scarichiamo)
+        let chunk_data = rfs_file.read_cache.entry(chunk_idx).or_insert_with(|| vec![0; chunk_size as usize]);
+
+        // 2. Scriviamo i dati nel blocco in RAM
+        let end_in_chunk = cmp::min(offset_in_chunk + data.len(), chunk_size as usize);
+        let bytes_to_copy = end_in_chunk - offset_in_chunk;
+        chunk_data[offset_in_chunk..end_in_chunk].copy_from_slice(&data[..bytes_to_copy]);
+
+        // 3. Segnamo il blocco come "sporco"
+        rfs_file.dirty_chunks.insert(chunk_idx);
+        rfs_file.is_dirty = true;
+
+        // 4. STREAMING: Se il blocco è completo o dopo N scritture, potremmo inviarlo.
+        // Per un vero streaming, potresti lanciare un thread qui o chiamare l'invio:
+        if end_in_chunk == chunk_size as usize {
+            self.upload_chunk(ino, chunk_idx);
+        }
+
+        reply.written(bytes_to_copy as u32);
     }
 
+    /*
     fn flush(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _lock: u64, reply: ReplyEmpty) {
         let inode = Inode(ino);
         if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
@@ -482,6 +570,18 @@ impl Filesystem for RemoteFS {
                     return;
                 }
                 rfs_file.is_dirty = false;
+            }
+        }
+        reply.ok();
+    }*/
+
+    fn flush(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        let inode = Inode(ino);
+        if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
+            if rfs_file.is_dirty {
+                // Qui invii tutto il file o i blocchi rimasti al server
+                info!("Flush: Invio modifiche finali al server per ino {}", ino);
+                self.sync_dirty_chunks(ino); 
             }
         }
         reply.ok();

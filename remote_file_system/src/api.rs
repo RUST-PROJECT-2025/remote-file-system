@@ -66,4 +66,20 @@ impl Api {
         let resp = self.client.patch(&url).json(&body).send().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
         if resp.status().is_success() { Ok(()) } else { Err(ErrorKind::Other.into()) }
     }
+
+    pub fn patch_file_contents(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), String> {
+        let url = format!("{}/files/{}?offset={}", self.base_url, path, offset);
+        
+        //let client = reqwest::blocking::Client::new();
+        let resp = self.client.patch(&url)
+            .body(data)
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("Server error: {}", resp.status()))
+        }
+    }
 }
