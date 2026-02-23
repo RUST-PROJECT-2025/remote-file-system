@@ -1,6 +1,7 @@
-use std::{collections::HashMap, path::PathBuf, time::SystemTime};
+use std::{path::PathBuf, num::NonZeroUsize};
 use shared::file_entry::FileEntry;
 use crate::api::Api;
+use lru::LruCache; // Import necessario
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Inode(pub u64);
@@ -13,21 +14,22 @@ pub struct CachedFile {
 
 #[derive(Debug)]
 pub struct Cache {
-    pub files: HashMap<Inode, CachedFile>,
+    // MODIFICA: HashMap -> LruCache
+    pub files: LruCache<Inode, CachedFile>,
     pub api: Api,
 }
 
 impl Cache {
-    pub fn new() -> Self {
-        let root = CachedFile {
-            file_entry: FileEntry {
-                ino: 1, name: "".to_string(), is_dir: true, size: 0, 
-                modified_at: SystemTime::UNIX_EPOCH, permissions: 0o755 
-            },
-            file_path: PathBuf::from("/"),
-        };
-        let mut files = HashMap::new();
-        files.insert(Inode(1), root);
+    // MODIFICA: Capacity configurabile
+    pub fn new(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
+        
+        // Inizializziamo la LRU
+        let mut files = LruCache::new(cap);
+        
+        // Non inseriamo root manualmente qui per semplicità con LRU, 
+        // verrà recuperata alla prima list_dir o lookup
+        
         Self { files, api: Api::new() }
     }
 
@@ -41,7 +43,8 @@ impl Cache {
             } else {
                 parent_path.join(&entry.name)
             };
-            self.files.insert(Inode(entry.ino), CachedFile {
+            // LRU put
+            self.files.put(Inode(entry.ino), CachedFile {
                 file_entry: entry.clone(),
                 file_path: full_path,
             });
@@ -49,7 +52,13 @@ impl Cache {
         Ok(entries)
     }
 
-    pub fn get_file_by_ino(&self, ino: Inode) -> Option<CachedFile> {
+    pub fn get_file_by_ino(&mut self, ino: Inode) -> Option<CachedFile> {
+        // LRU get (promuove l'elemento come "usato di recente")
         self.files.get(&ino).cloned()
+    }
+    
+    // Metodo helper per peek senza alterare l'ordine LRU (opzionale)
+    pub fn peek_file_by_ino(&self, ino: Inode) -> Option<CachedFile> {
+        self.files.peek(&ino).cloned()
     }
 }

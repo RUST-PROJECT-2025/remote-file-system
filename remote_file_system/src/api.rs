@@ -1,6 +1,6 @@
 use reqwest::{blocking::Client, StatusCode};
 use shared::file_entry::FileEntry;
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read};
 
 #[derive(Debug, Clone)]
 pub struct Api {
@@ -42,9 +42,16 @@ impl Api {
         }
     }
 
-    pub fn write_file(&self, path: &str, data: Vec<u8>) -> Result<(), Error> {
+   // Accetta un generic 'R' che implementa Read + Send (es. File)
+    pub fn write_file<R: Read + Send + 'static>(&self, path: &str, data: R) -> Result<(), Error> {
         let url = format!("{}files{}", self.base_url, path);
-        let resp = self.client.put(&url).body(data).send().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+        
+        // Reqwest blocking supporta il passaggio diretto di un Reader nel Body
+        let resp = self.client.put(&url)
+            .body(reqwest::blocking::Body::new(data))
+            .send()
+            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+            
         if resp.status().is_success() { Ok(()) } else { Err(ErrorKind::Other.into()) }
     }
 
