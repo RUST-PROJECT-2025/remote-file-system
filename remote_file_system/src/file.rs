@@ -36,13 +36,13 @@ pub struct RfsFile {
     pub file_path: PathBuf,
     pub fds: HashMap<Fd, OpenedFile>,
     
-    pub write_buffer: Option<Vec<u8>>, 
+    // pub write_buffer: Option<Vec<u8>>, 
     pub dirty_chunks: HashSet<u64>,
     pub is_dirty: bool,
 
     //pub read_buffer: Vec<u8>,
     pub read_cache: HashMap<u64, Vec<u8>>, 
-    pub read_buffer_offset: u64,
+    // pub read_buffer_offset: u64,
 
     // flag per gestione unlink su file aperti
     pub unlinked: bool,
@@ -54,12 +54,12 @@ impl From<MetadataEntry> for RfsFile {
             file_entry: md.file_entry,
             file_path: md.file_path,
             fds: HashMap::new(),
-            write_buffer: None,
+            //write_buffer: None,
             dirty_chunks: HashSet::new(),
             is_dirty: false,
             // read_buffer: Vec::new(),
             read_cache: HashMap::new(),
-            read_buffer_offset: 0,
+            //read_buffer_offset: 0,
             unlinked: false,
         }
     }

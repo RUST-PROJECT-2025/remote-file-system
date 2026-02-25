@@ -68,10 +68,11 @@ impl Api {
     }
 
     pub fn patch_file_contents(&self, path: &str, offset: u64, data: Vec<u8>) -> Result<(), String> {
-        let url = format!("{}/files/{}?offset={}", self.base_url, path, offset);
+        let url = format!("{}files{}?offset={}", self.base_url, path, offset);
         
         //let client = reqwest::blocking::Client::new();
         let resp = self.client.patch(&url)
+            .header("Content-Type", "application/octet-stream")
             .body(data)
             .send()
             .map_err(|e| e.to_string())?;
@@ -82,4 +83,5 @@ impl Api {
             Err(format!("Server error: {}", resp.status()))
         }
     }
+
 }
