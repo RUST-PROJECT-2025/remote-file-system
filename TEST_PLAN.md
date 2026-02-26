@@ -54,22 +54,38 @@ This document describes the comprehensive test suite for verifying compliance wi
 
 #### 1. Build the Project
 ```bash
-cd /mnt/c/Users/chry0/desktop/progetto\ rust/remote-file-system
 cargo build --bin remote_file_system
 cargo build --bin rfs_server  # if testing API integration
 ```
 
 #### 2. Run Bash Test Suite (FUSE Filesystem)
+
+**Important:** Ensure SKIP_SETUP is not set from a previous run:
+
 ```bash
 # Make test script executable
 chmod +x test_suite.sh
 
-# Run all tests
+# CRITICAL: Reset environment to start fresh
+unset SKIP_SETUP
+
+# Run all tests (will automatically mount daemon and run all suites)
 ./test_suite.sh
 
-# Or run specific test categories
-# Edit test_suite.sh and comment out unwanted test suites
+# Alternative: explicitly set SKIP_SETUP to 0
+SKIP_SETUP=0 ./test_suite.sh
+
+# To skip daemon setup (if already running):
+SKIP_SETUP=1 ./test_suite.sh
 ```
+
+**Note:** The test script will:
+1. Build binaries if needed
+2. Start the RFS HTTP server (on port 8080)
+3. Start the FUSE daemon
+4. Mount the filesystem
+5. Run 24 tests across 9 suites
+6. Cleanup and unmount on completion
 
 #### 3. Run API Tests (Postman Collection)
 ```bash
@@ -417,20 +433,48 @@ DELETE /files/nonexistent.txt → 404 Not Found
 
 ## Running the Full Test Suite
 
-### Step-by-Step
+### Quick Start (Recommended)
 
-**Terminal 1 - Start FUSE Daemon:**
-```bash
-cd /mnt/c/Users/chry0/desktop/progetto\ rust/remote-file-system/remote_file_system
-cargo run --bin remote_file_system -- --mount-point /tmp/rfs-test-mount
-```
-
-**Terminal 2 - Run Tests:**
+**Single Terminal - Automatic Setup:**
 ```bash
 cd /mnt/c/Users/chry0/desktop/progetto\ rust/remote-file-system
+
+# Reset environment (IMPORTANT!)
+unset SKIP_SETUP
+
+# Make script executable
 chmod +x test_suite.sh
+
+# Run tests (server + daemon will start automatically)
 ./test_suite.sh
 ```
+
+This will automatically:
+- Start the RFS HTTP server on `http://127.0.0.1:8080/`
+- Start the FUSE daemon
+- Mount the filesystem at `/tmp/rfs-test-mount`
+- Run all 24 tests across 9 suites
+- Cleanup and unmount on completion
+
+**No manual server/daemon startup required!** ✅
+
+### Alternative: Manual Daemon Start (Advanced)
+
+**Terminal 1 - Start FUSE Daemon manually:**
+```bash
+cd /mnt/c/Users/chry0/desktop/progetto\ rust/remote-file-system
+cargo run --bin remote_file_system -- --mount-point /tmp/rfs-test-mount &
+sleep 2
+```
+
+**Terminal 2 - Run Tests with existing daemon:**
+```bash
+cd /mnt/c/Users/chry0/desktop/progetto\ rust/remote-file-system
+unset SKIP_SETUP
+SKIP_SETUP=1 ./test_suite.sh
+```
+
+Note: When using `SKIP_SETUP=1`, the daemon must already be running and the mount point must be active.
 
 **Expected Output:**
 ```

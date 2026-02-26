@@ -18,10 +18,20 @@ NC='\033[0m' # No Color
 # Configuration
 MOUNT_POINT="/tmp/rfs-test-mount"
 RFS_BINARY="./target/debug/remote_file_system"
+RFS_SERVER_BINARY="./target/debug/rfs_server"
 RFS_PID=""
+RFS_SERVER_PID=""
 TEST_RESULTS=0
 TEST_PASSED=0
+# Only use SKIP_SETUP if explicitly passed from environment
+# Default to 0 (do full setup) to ensure clean test runs
 SKIP_SETUP=${SKIP_SETUP:-0}
+
+# Debug: show what mode we're in
+if [ "$SKIP_SETUP" = "1" ]; then
+    # This is intentional - user wants to skip setup
+    :
+fi
 
 ##############################################################################
 # Utility Functions
@@ -59,6 +69,14 @@ cleanup() {
         return
     fi
 
+    # Kill RFS server if we started it
+    if [ ! -z "$RFS_SERVER_PID" ] && kill -0 $RFS_SERVER_PID 2>/dev/null; then
+        log_info "Stopping RFS server (PID: $RFS_SERVER_PID)"
+        kill $RFS_SERVER_PID 2>/dev/null || true
+        sleep 1
+    fi
+
+    # Kill FUSE daemon
     if [ ! -z "$RFS_PID" ] && kill -0 $RFS_PID 2>/dev/null; then
         log_info "Stopping FUSE daemon (PID: $RFS_PID)"
         kill $RFS_PID 2>/dev/null || true
@@ -67,7 +85,14 @@ cleanup() {
 
     if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
         log_info "Unmounting $MOUNT_POINT"
-        fusermount -u "$MOUNT_POINT" 2>/dev/null || true
+        # Try common fusermount variants, then fallback to umount
+        if command -v fusermount >/dev/null 2>&1; then
+            fusermount -u "$MOUNT_POINT" 2>/dev/null || true
+        elif command -v fusermount3 >/dev/null 2>&1; then
+            fusermount3 -u "$MOUNT_POINT" 2>/dev/null || true
+        else
+            umount "$MOUNT_POINT" 2>/dev/null || true
+        fi
         sleep 1
     fi
 
@@ -88,11 +113,40 @@ setup() {
     mkdir -p "$MOUNT_POINT"
     log_pass "Mount point created: $MOUNT_POINT"
     
-    # Check if binary exists
+    # Check if binaries exist
     if [ ! -f "$RFS_BINARY" ]; then
         log_fail "Binary not found: $RFS_BINARY"
         log_info "Building project..."
         cargo build --bin remote_file_system
+    fi
+    
+    if [ ! -f "$RFS_SERVER_BINARY" ]; then
+        log_fail "Server binary not found: $RFS_SERVER_BINARY"
+        log_info "Building server..."
+        cargo build --bin rfs_server
+    fi
+    
+    # Start RFS HTTP server first
+    log_info "Starting RFS server on http://127.0.0.1:8080..."
+    $RFS_SERVER_BINARY > /tmp/rfs_server.log 2>&1 &
+    RFS_SERVER_PID=$!
+    
+    # Wait for server to be ready
+    local max_attempts=15
+    local attempt=0
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -s http://127.0.0.1:8080/api/list/ > /dev/null 2>&1; then
+            log_pass "RFS server is ready"
+            sleep 1
+            break
+        fi
+        sleep 1
+        ((attempt++))
+    done
+
+    if [ $attempt -eq $max_attempts ]; then
+        log_fail "RFS server failed to start"
+        return 1
     fi
     
     # Start FUSE daemon
