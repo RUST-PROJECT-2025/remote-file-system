@@ -63,14 +63,36 @@ impl Api {
 
     pub fn delete_file_or_directory(&self, path: &str) -> Result<(), Error> {
         let url = format!("{}files{}", self.base_url, path);
-        let resp = self.client.delete(&url).send().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
-        if resp.status().is_success() { Ok(()) } else { Err(ErrorKind::Other.into()) }
+        log::info!("DELETE request to: {}", url);
+        let resp = self.client.delete(&url).send().map_err(|e| {
+            log::error!("DELETE failed with network error: {}", e);
+            Error::new(ErrorKind::Other, e.to_string())
+        })?;
+        log::info!("DELETE response status: {}", resp.status());
+        if resp.status().is_success() { 
+            log::info!("DELETE succeeded");
+            Ok(()) 
+        } else { 
+            log::error!("DELETE failed with HTTP status: {}", resp.status());
+            Err(ErrorKind::Other.into()) 
+        }
     }
 
     pub fn rename(&self, path: &str, new_name: &str) -> Result<(), Error> {
         let url = format!("{}files{}", self.base_url, path);
         let body = serde_json::json!({ "new_name": new_name });
-        let resp = self.client.patch(&url).json(&body).send().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
-        if resp.status().is_success() { Ok(()) } else { Err(ErrorKind::Other.into()) }
+        log::info!("PATCH request to: {} with new_name: {}", url, new_name);
+        let resp = self.client.patch(&url).json(&body).send().map_err(|e| {
+            log::error!("PATCH failed with network error: {}", e);
+            Error::new(ErrorKind::Other, e.to_string())
+        })?;
+        log::info!("PATCH response status: {}", resp.status());
+        if resp.status().is_success() { 
+            log::info!("PATCH succeeded");
+            Ok(()) 
+        } else { 
+            log::error!("PATCH failed with HTTP status: {}", resp.status());
+            Err(ErrorKind::Other.into()) 
+        }
     }
 }

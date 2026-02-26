@@ -519,8 +519,14 @@ impl Filesystem for RemoteFS {
         }
 
         if should_delete {
-            info!("Final delete (delayed): {}", delete_path);
-            let _ = self.cache.api.delete_file_or_directory(&delete_path);
+            info!("Chiusura finale file unlinked. Cancellazione fisica: {}", delete_path);
+            // Nota: il file potrebbe essere già stato cancellato da unlink(), quindi 
+            // ignoriamo errori - il file è comunque rimosso logicamente.
+            match self.cache.api.delete_file_or_directory(&delete_path) {
+                Ok(_) => info!("File deleted successfully during release"),
+                Err(e) => info!("File already deleted or error during release: {}", e),
+            }
+            // Rimuoviamo definitivamente dalla mappa dei file aperti
             self.rfs_files.remove(&inode);
         }
 
