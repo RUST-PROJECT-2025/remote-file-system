@@ -1,28 +1,31 @@
-use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyDirectory, ReplyEntry, ReplyOpen,
-    ReplyWrite, ReplyCreate, ReplyEmpty, ReplyData, Request, TimeOrNow,
-};
-use libc::{EBADF, ENOENT, EIO, ENOTEMPTY};
-use log::{info, error};
-use std::{
-    collections::HashMap, 
-    ffi::OsStr, 
-    time::{Duration, SystemTime}, 
-    path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-    io::{Read, Write, Seek, SeekFrom},
-    process::Command,
-    cmp
-};
-use shared::file_entry::FileEntry;
 use clap::Parser;
 use daemonize::Daemonize;
+use fuser::{
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+};
+use libc::{EBADF, EIO, ENOENT, ENOTEMPTY};
+use log::{error, info};
+use shared::file_entry::FileEntry;
+use std::{
+    cmp,
+    collections::HashMap,
+    ffi::OsStr,
+    io::{Read, Seek, SeekFrom, Write},
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime},
+};
 
 mod api;
 mod cache;
 mod file;
 
-use crate::{cache::{Cache, Inode}, file::{OpenFlags, OpenedFile, RfsFile}};
+use crate::{
+    cache::{Cache, Inode},
+    file::{OpenFlags, OpenedFile, RfsFile},
+};
 
 const PREFETCH_SIZE: u32 = 5 * 1024 * 1024; // 5 MB Read Ahead
 
@@ -65,10 +68,18 @@ impl From<FileEntry> for FileAttrWrapper {
             mtime: val.modified_at,
             ctime: val.modified_at,
             crtime: val.modified_at,
-            kind: if val.is_dir { FileType::Directory } else { FileType::RegularFile },
+            kind: if val.is_dir {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            },
             perm: val.permissions as u16,
             nlink: 1,
-            uid: 1000, gid: 1000, rdev: 0, blksize: 512, flags: 0,
+            uid: 1000,
+            gid: 1000,
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
         })
     }
 }
@@ -85,19 +96,22 @@ struct RemoteFS {
 impl RemoteFS {
     fn new(use_cache: bool, cache_capacity: usize, ttl_secs: u64) -> Self {
         let mut cache = Cache::new(cache_capacity, Duration::from_secs(ttl_secs));
-        
+
         // Inizializziamo manualmente la Root (Inode 1)
-        cache.files.put(Inode(1), crate::cache::CachedFile {
-            file_entry: FileEntry {
-                ino: 1,
-                name: "/".to_string(),
-                is_dir: true,
-                size: 0,
-                modified_at: SystemTime::now(),
-                permissions: 0o755,
+        cache.files.put(
+            Inode(1),
+            crate::cache::CachedFile {
+                file_entry: FileEntry {
+                    ino: 1,
+                    name: "/".to_string(),
+                    is_dir: true,
+                    size: 0,
+                    modified_at: SystemTime::now(),
+                    permissions: 0o755,
+                },
+                file_path: PathBuf::from("/"),
             },
-            file_path: PathBuf::from("/"),
-        });
+        );
 
         Self {
             cache,
@@ -108,19 +122,23 @@ impl RemoteFS {
         }
     }
 
-    fn alloc_fd(&self) -> Fd { Fd(self.last_fd.fetch_add(1, Ordering::SeqCst)) }
+    fn alloc_fd(&self) -> Fd {
+        Fd(self.last_fd.fetch_add(1, Ordering::SeqCst))
+    }
 
     fn get_path_str(&mut self, ino: Inode) -> Option<String> {
-        // Gestione speciale Root 
-        if ino.0 == 1 { 
-            return Some("/".to_string()); 
+        // Gestione speciale Root
+        if ino.0 == 1 {
+            return Some("/".to_string());
         }
-        self.cache.get_file_by_ino(ino).map(|f| f.file_path.to_string_lossy().to_string())
+        self.cache
+            .get_file_by_ino(ino)
+            .map(|f| f.file_path.to_string_lossy().to_string())
     }
 }
 
 impl Filesystem for RemoteFS {
-    // METADATA 
+    // METADATA
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if let Some(rfs_file) = self.rfs_files.get(&Inode(ino)) {
@@ -130,12 +148,12 @@ impl Filesystem for RemoteFS {
                 if let Ok(metadata) = rfs_file.write_buffer.as_ref().unwrap().as_file().metadata() {
                     attr.size = metadata.len();
                 }
-                attr.mtime = SystemTime::now(); 
+                attr.mtime = SystemTime::now();
             }
             reply.attr(&self.ttl, &attr);
             return;
         }
-        
+
         match self.cache.get_file_by_ino(Inode(ino)) {
             Some(f) => reply.attr(&self.ttl, &FileAttrWrapper::from(f.file_entry).0),
             None => reply.error(ENOENT),
@@ -145,19 +163,31 @@ impl Filesystem for RemoteFS {
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: i32, reply: ReplyEmpty) {
         reply.ok();
     }
-    
+
     fn setattr(
-        &mut self, _req: &Request<'_>, ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>,
-        size: Option<u64>, _atime: Option<TimeOrNow>, _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr,
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
     ) {
         let inode = Inode(ino);
         if let Some(new_size) = size {
             if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
                 // Inizializza buffer su disco se non esiste
-                if rfs_file.write_buffer.is_none() { 
-                    rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap()); 
+                if rfs_file.write_buffer.is_none() {
+                    rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
                 }
                 // Truncate del file temporaneo
                 let file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
@@ -174,12 +204,12 @@ impl Filesystem for RemoteFS {
         let parent_path = match self.get_path_str(Inode(parent)) {
             Some(p) => p, None => { reply.error(ENOENT); return; }
         };
-        
+
         // Refresh directory
         let _ = self.cache.list_dir(&parent_path);
-        
+
         let target_path = PathBuf::from(&parent_path).join(name.to_string_lossy().as_ref());
-        
+
         let found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(i, f)| (*i, f.clone()));
 
         match found {
@@ -190,48 +220,98 @@ impl Filesystem for RemoteFS {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
-        
+
         let target_path = PathBuf::from(&parent_path).join(name.to_string_lossy().as_ref());
-        
+
         // Cerchiamo prima nella cache locale
-        let mut found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(i, f)| (*i, f.clone()));
+        let mut found = self
+            .cache
+            .files
+            .iter()
+            .find(|(_, f)| f.file_path == target_path)
+            .map(|(i, f)| (*i, f.clone()));
 
         // Se non c'è, ALLORA scarichiamo dal server
         if found.is_none() {
-             let _ = self.cache.list_dir(&parent_path);
-             found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(i, f)| (*i, f.clone()));
+            let _ = self.cache.list_dir(&parent_path);
+            found = self
+                .cache
+                .files
+                .iter()
+                .find(|(_, f)| f.file_path == target_path)
+                .map(|(i, f)| (*i, f.clone()));
         }
 
         match found {
-            Some((_, f)) => reply.entry(&Duration::from_secs(1), &FileAttrWrapper::from(f.file_entry).0, 0),
+            Some((_, f)) => reply.entry(
+                &Duration::from_secs(1),
+                &FileAttrWrapper::from(f.file_entry).0,
+                0,
+            ),
             None => {
                 // Diciamo al Kernel: "Non c'è, ma non ricordartelo! Chiedimelo sempre."
-                reply.entry(&Duration::from_secs(0), &FileAttr { 
-                    ino: 0, size: 0, blocks: 0, atime: SystemTime::UNIX_EPOCH, 
-                    mtime: SystemTime::UNIX_EPOCH, ctime: SystemTime::UNIX_EPOCH, 
-                    crtime: SystemTime::UNIX_EPOCH, kind: FileType::RegularFile, 
-                    perm: 0, nlink: 0, uid: 0, gid: 0, rdev: 0, blksize: 0, flags: 0 
-                }, 0);
+                reply.entry(
+                    &Duration::from_secs(0),
+                    &FileAttr {
+                        ino: 0,
+                        size: 0,
+                        blocks: 0,
+                        atime: SystemTime::UNIX_EPOCH,
+                        mtime: SystemTime::UNIX_EPOCH,
+                        ctime: SystemTime::UNIX_EPOCH,
+                        crtime: SystemTime::UNIX_EPOCH,
+                        kind: FileType::RegularFile,
+                        perm: 0,
+                        nlink: 0,
+                        uid: 0,
+                        gid: 0,
+                        rdev: 0,
+                        blksize: 0,
+                        flags: 0,
+                    },
+                    0,
+                );
                 // Oppure, se la tua libreria lo supporta più semplicemente:
-                // reply.error(ENOENT); 
-                // Ma in molti ambienti FUSE3, se non mandi un entry con TTL 0, 
+                // reply.error(ENOENT);
+                // Ma in molti ambienti FUSE3, se non mandi un entry con TTL 0,
                 // lui usa un default di qualche secondo per il "negative cache".
             }
         }
     }
 
-    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
         let path = match self.get_path_str(Inode(ino)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
-        
+
         match self.cache.list_dir(&path) {
             Ok(entries) => {
                 for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
-                    let kind = if entry.is_dir { FileType::Directory } else { FileType::RegularFile };
-                    if reply.add(entry.ino, (i + 1) as i64, kind, &entry.name) { break; }
+                    let kind = if entry.is_dir {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    };
+                    if reply.add(entry.ino, (i + 1) as i64, kind, &entry.name) {
+                        break;
+                    }
                 }
                 reply.ok();
             }
@@ -241,100 +321,197 @@ impl Filesystem for RemoteFS {
 
     // --- CREAZIONE / RIMOZIONE ---
 
-    fn mkdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
-        let new_path = PathBuf::from(&parent_path).join(name).to_string_lossy().to_string();
-        
+        let new_path = PathBuf::from(&parent_path)
+            .join(name)
+            .to_string_lossy()
+            .to_string();
+
         match self.cache.api.create_directory(&new_path) {
             Ok(_) => {
                 self.cache.dir_cache.remove(&parent_path);
-                let _ = self.cache.list_dir(&parent_path); 
+                let _ = self.cache.list_dir(&parent_path);
                 let target_path = PathBuf::from(new_path);
-                
-                let found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(_, f)| f.clone());
+
+                let found = self
+                    .cache
+                    .files
+                    .iter()
+                    .find(|(_, f)| f.file_path == target_path)
+                    .map(|(_, f)| f.clone());
                 match found {
-                    Some(f) => reply.entry(&Duration::from_secs(1), &FileAttrWrapper::from(f.file_entry).0, 0),
+                    Some(f) => reply.entry(
+                        &Duration::from_secs(1),
+                        &FileAttrWrapper::from(f.file_entry).0,
+                        0,
+                    ),
                     None => {
                         self.cache.dir_cache.remove(&parent_path);
                         reply.error(EIO)
-                    },
+                    }
                 }
-            },
+            }
             Err(_) => reply.error(EIO),
         }
     }
 
-    fn mknod(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _rdev: u32, reply: ReplyEntry) {
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let new_path = PathBuf::from(&parent_path).join(name);
-        
-        if self.cache.api.write_file(&new_path.to_string_lossy(), std::io::empty()).is_err() { 
-            reply.error(EIO); 
-            return; 
+
+        if self
+            .cache
+            .api
+            .write_file(&new_path.to_string_lossy(), std::io::empty())
+            .is_err()
+        {
+            reply.error(EIO);
+            return;
         }
 
         self.cache.dir_cache.remove(&parent_path);
         let _ = self.cache.list_dir(&parent_path);
-        let found = self.cache.files.iter().find(|(_, f)| f.file_path == new_path).map(|(_, f)| f.clone());
+        let found = self
+            .cache
+            .files
+            .iter()
+            .find(|(_, f)| f.file_path == new_path)
+            .map(|(_, f)| f.clone());
 
         match found {
-            Some(cached) => reply.entry(&Duration::from_secs(1), &FileAttrWrapper::from(cached.file_entry).0, 0),
+            Some(cached) => reply.entry(
+                &Duration::from_secs(1),
+                &FileAttrWrapper::from(cached.file_entry).0,
+                0,
+            ),
             None => {
                 self.cache.dir_cache.remove(&parent_path);
                 reply.error(EIO)
-            },
+            }
         }
     }
 
-    fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, _flags: i32, reply: ReplyCreate) {
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let new_path = PathBuf::from(&parent_path).join(name);
-        
-        if self.cache.api.write_file(&new_path.to_string_lossy(), std::io::empty()).is_err() { 
-            reply.error(EIO); return; 
+
+        if self
+            .cache
+            .api
+            .write_file(&new_path.to_string_lossy(), std::io::empty())
+            .is_err()
+        {
+            reply.error(EIO);
+            return;
         }
-        
+
         self.cache.dir_cache.remove(&parent_path);
         let _ = self.cache.list_dir(&parent_path);
-        let found = self.cache.files.iter().find(|(_, f)| f.file_path == new_path).map(|(_, f)| f.clone());
+        let found = self
+            .cache
+            .files
+            .iter()
+            .find(|(_, f)| f.file_path == new_path)
+            .map(|(_, f)| f.clone());
 
         match found {
             Some(cached) => {
                 let fd = self.alloc_fd();
                 let ino = Inode(cached.file_entry.ino);
                 let mut rfs_file = RfsFile::from(cached);
-                
-                rfs_file.fds.insert(fd, OpenedFile { fd, ino, flags: OpenFlags::WRITE });
-                rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap()); 
+
+                rfs_file.fds.insert(
+                    fd,
+                    OpenedFile {
+                        fd,
+                        ino,
+                        flags: OpenFlags::WRITE,
+                    },
+                );
+                rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
                 rfs_file.is_dirty = true;
-                
+
                 let entry_for_reply = rfs_file.file_entry.clone();
                 self.rfs_files.insert(ino, rfs_file);
-                
-                reply.created(&Duration::from_secs(1), &FileAttrWrapper::from(entry_for_reply).0, 0, fd.0, 0);
-            },
+
+                reply.created(
+                    &Duration::from_secs(1),
+                    &FileAttrWrapper::from(entry_for_reply).0,
+                    0,
+                    fd.0,
+                    0,
+                );
+            }
             None => reply.error(EIO),
         }
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let target_path = PathBuf::from(&parent_path).join(name);
         let target_path_str = target_path.to_string_lossy().to_string();
 
-        let found_entry = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(_, f)| f.clone());
+        let found_entry = self
+            .cache
+            .files
+            .iter()
+            .find(|(_, f)| f.file_path == target_path)
+            .map(|(_, f)| f.clone());
 
         if let Some(cached) = found_entry.clone() {
             let inode = Inode(cached.file_entry.ino);
-            
+
             let is_open = if let Some(rfs_file) = self.rfs_files.get(&inode) {
                 !rfs_file.fds.is_empty()
             } else {
@@ -343,7 +520,10 @@ impl Filesystem for RemoteFS {
 
             if is_open {
                 let new_name = format!(".deleted_{}_{}", inode.0, name.to_string_lossy());
-                info!("Unlink su file aperto (ino={}). Rename -> {}", inode.0, new_name);
+                info!(
+                    "Unlink su file aperto (ino={}). Rename -> {}",
+                    inode.0, new_name
+                );
 
                 match self.cache.api.rename(&target_path_str, &new_name) {
                     Ok(_) => {
@@ -353,7 +533,7 @@ impl Filesystem for RemoteFS {
                         }
                         let _ = self.cache.list_dir(&parent_path);
                         reply.ok();
-                    },
+                    }
                     Err(_) => reply.error(EIO),
                 }
                 return;
@@ -371,44 +551,82 @@ impl Filesystem for RemoteFS {
                 //let _ = self.cache.list_dir(&parent_path);
 
                 reply.ok()
-            },
+            }
             Err(_) => reply.error(EIO),
         }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let target_path = PathBuf::from(&parent_path).join(name);
         let target = target_path.to_string_lossy().to_string();
-        
+
         match self.cache.api.delete_file_or_directory(&target) {
             Ok(_) => {
                 // rimuovi la directory eliminata dalla cache locale
-                let found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(i, _)| *i);
+                let found = self
+                    .cache
+                    .files
+                    .iter()
+                    .find(|(_, f)| f.file_path == target_path)
+                    .map(|(i, _)| *i);
                 if let Some(ino) = found {
                     self.cache.files.pop(&ino);
                 }
 
-                // forza l'aggiornamento della cartella padre 
+                // forza l'aggiornamento della cartella padre
                 //let _ = self.cache.list_dir(&parent_path);
                 self.cache.invalidate_dir(&parent_path);
 
                 reply.ok()
-            },
-            Err(_) => reply.error(ENOTEMPTY), 
+            }
+            Err(_) => reply.error(ENOTEMPTY),
         }
     }
 
-    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, _new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {
+    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {
         let parent_path = match self.get_path_str(Inode(parent)) {
             Some(p) => p, None => { reply.error(ENOENT); return; }
         };
+        let new_parent_path = match self.get_path_str(Inode(new_parent)) {
+            Some(p) => p, None => { reply.error(ENOENT); return; }
+        };
+        
         let old_path = PathBuf::from(&parent_path).join(name).to_string_lossy().to_string();
-        match self.cache.api.rename(&old_path, &new_name.to_string_lossy()) {
+        
+        let new_name_str = new_name.to_string_lossy().to_string();
+        
+        let new_full_path = PathBuf::from(&new_parent_path).join(new_name);
+
+        // passiamo new_name_str all'API
+        match self.cache.api.rename(&old_path, &new_name_str) {
             Ok(_) => {
-                self.cache.dir_cache.remove(&parent_path);
+                let target_path = PathBuf::from(&parent_path).join(name);
+                
+                // cerchiamo il vecchio file in cache
+                let found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(i, _)| *i);
+                if let Some(ino) = found {
+                    // rimuoviamo dai metadati cache
+                    self.cache.files.pop(&ino);
+                    
+                    // aggiorniamo il file path anche in rfs_files se è aperto
+                    if let Some(rfs_file) = self.rfs_files.get_mut(&ino) {
+                        rfs_file.file_path = new_full_path.clone();
+                    }
+                }
+
+                // invalidiamo le cartelle per forzare il server a mandare i dati nuovi
+                self.cache.invalidate_dir(&parent_path);
+                if parent_path != new_parent_path {
+                    self.cache.invalidate_dir(&new_parent_path);
+                }
+                
                 reply.ok()
             }, 
             Err(_) => reply.error(EIO),
@@ -423,10 +641,17 @@ impl Filesystem for RemoteFS {
             let fd = self.alloc_fd();
             let open_flags = OpenFlags::from_flags(flags);
             let rfs_file = self.rfs_files.entry(inode).or_insert(RfsFile::from(cached));
-            rfs_file.fds.insert(fd, OpenedFile { fd, ino: inode, flags: open_flags });
-            
+            rfs_file.fds.insert(
+                fd,
+                OpenedFile {
+                    fd,
+                    ino: inode,
+                    flags: open_flags,
+                },
+            );
+
             if open_flags.is_write() && rfs_file.write_buffer.is_none() {
-                 rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
+                rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
             }
             reply.opened(fd.0, 0);
         } else {
@@ -434,16 +659,27 @@ impl Filesystem for RemoteFS {
         }
     }
 
-    fn read(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, size: u32, _flags: i32, _lock: Option<u64>, reply: ReplyData) {
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyData,
+    ) {
         let inode = Inode(ino);
-        
+
         if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
                 let temp_file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
                 if temp_file.seek(SeekFrom::Start(offset as u64)).is_err() {
-                    reply.error(EIO); return;
+                    reply.error(EIO);
+                    return;
                 }
-                
+
                 let mut buf = vec![0u8; size as usize];
                 match temp_file.read(&mut buf) {
                     Ok(n) => reply.data(&buf[0..n]),
@@ -456,13 +692,13 @@ impl Filesystem for RemoteFS {
         let rfs_file = match self.rfs_files.get_mut(&inode) {
             Some(f) => f,
             None => {
-                 if let Some(cached) = self.cache.get_file_by_ino(inode) {
-                     self.rfs_files.insert(inode, RfsFile::from(cached));
-                     self.rfs_files.get_mut(&inode).unwrap()
-                 } else {
-                     reply.error(ENOENT);
-                     return;
-                 }
+                if let Some(cached) = self.cache.get_file_by_ino(inode) {
+                    self.rfs_files.insert(inode, RfsFile::from(cached));
+                    self.rfs_files.get_mut(&inode).unwrap()
+                } else {
+                    reply.error(ENOENT);
+                    return;
+                }
             }
         };
 
@@ -483,39 +719,56 @@ impl Filesystem for RemoteFS {
 
         info!("Prefetching ino={} offset={}", ino, req_start);
 
-        match self.cache.api.read_file_contents(&path, req_start, fetch_size) {
+        match self
+            .cache
+            .api
+            .read_file_contents(&path, req_start, fetch_size)
+        {
             Ok(data) => {
                 rfs_file.read_buffer = data;
                 rfs_file.read_buffer_offset = req_start;
-                
+
                 let available = rfs_file.read_buffer.len();
                 let slice_len = cmp::min(size as usize, available);
                 reply.data(&rfs_file.read_buffer[0..slice_len]);
-            },
+            }
             Err(_) => reply.error(EIO),
         }
     }
 
-    fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], _wflags: u32, _flags: i32, _lock: Option<u64>, reply: ReplyWrite) {
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _wflags: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: ReplyWrite,
+    ) {
         if let Some(rfs_file) = self.rfs_files.get_mut(&Inode(ino)) {
-            if rfs_file.write_buffer.is_none() { 
-                rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap()); 
+            if rfs_file.write_buffer.is_none() {
+                rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
             }
-            
+
             let file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
-            
+
             if file.seek(SeekFrom::Start(offset as u64)).is_err() {
-                reply.error(EIO); return;
+                reply.error(EIO);
+                return;
             }
             if file.write_all(data).is_err() {
-                reply.error(EIO); return;
+                reply.error(EIO);
+                return;
             }
 
             rfs_file.is_dirty = true;
             if let Ok(meta) = file.metadata() {
                 rfs_file.file_entry.size = meta.len();
             }
-            
+
             reply.written(data.len() as u32);
         } else {
             reply.error(EBADF);
@@ -528,27 +781,28 @@ impl Filesystem for RemoteFS {
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
                 let temp_file = rfs_file.write_buffer.as_mut().unwrap();
                 let path = rfs_file.file_path.to_string_lossy().to_string();
-                
+
                 if let Ok(reader) = temp_file.reopen() {
                     info!("Streaming flush: {}", path);
                     if self.cache.api.write_file(&path, reader).is_err() {
                         reply.error(EIO);
                         return;
                     }
-                    
-                    // sincronizzazione cache e Metadati 
+
+                    // sincronizzazione cache e Metadati
                     if let Ok(meta) = temp_file.as_file().metadata() {
                         rfs_file.file_entry.size = meta.len();
-                        rfs_file.file_entry.modified_at = meta.modified().unwrap_or(SystemTime::now());
-                        
-                        // aggiorna cache 
+                        rfs_file.file_entry.modified_at =
+                            meta.modified().unwrap_or(SystemTime::now());
+
+                        // aggiorna cache
                         if let Some(mut cached) = self.cache.files.get(&inode).cloned() {
                             cached.file_entry.size = meta.len();
                             cached.file_entry.modified_at = rfs_file.file_entry.modified_at;
                             self.cache.files.put(inode, cached);
                         }
                     }
-                    
+
                     rfs_file.is_dirty = false;
                 } else {
                     reply.error(EIO);
@@ -559,7 +813,16 @@ impl Filesystem for RemoteFS {
         reply.ok();
     }
 
-    fn release(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _flags: i32, _lock: Option<u64>, _flush: bool, reply: ReplyEmpty) {
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
         let inode = Inode(ino);
         let mut should_delete = false;
         let mut delete_path = String::new();
@@ -591,7 +854,9 @@ impl Filesystem for RemoteFS {
 
 fn main() {
     //env_logger::builder().filter_level(log::LevelFilter::Info).init();
-    env_logger::builder().filter_level(log::LevelFilter::Debug).init();
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Debug)
+        .init();
 
     let args = Args::parse();
     let mountpoint = args.mount_point.clone();
@@ -603,13 +868,14 @@ fn main() {
             .pid_file("/tmp/rfs.pid")
             .stdout(log_file.try_clone().unwrap())
             .stderr(log_file)
-            .start() {
-                Ok(_) => info!("Daemon avviato."),
-                Err(e) => {
-                    eprintln!("Errore daemonize: {}", e);
-                    return;
-                }
+            .start()
+        {
+            Ok(_) => info!("Daemon avviato."),
+            Err(e) => {
+                eprintln!("Errore daemonize: {}", e);
+                return;
             }
+        }
     }
 
     //let mp_clone = mountpoint.clone();
@@ -620,18 +886,25 @@ fn main() {
     }).expect("Errore handler Ctrl-C");*/
 
     let fs = RemoteFS::new(!args.no_cache, args.cache_capacity, args.ttl);
-    
+
     if !std::path::Path::new(&mountpoint).exists() {
         std::fs::create_dir_all(&mountpoint).unwrap();
     }
-    
-    info!("Mounting at {} (Cache: {}, TTL: {}s)", mountpoint, !args.no_cache, args.ttl);
 
-    if let Err(e) = fuser::mount2(fs, &mountpoint, &[
-        MountOption::FSName("remote_fs".to_string()), 
-        MountOption::AutoUnmount, 
-        MountOption::AllowOther
-    ]) {
+    info!(
+        "Mounting at {} (Cache: {}, TTL: {}s)",
+        mountpoint, !args.no_cache, args.ttl
+    );
+
+    if let Err(e) = fuser::mount2(
+        fs,
+        &mountpoint,
+        &[
+            MountOption::FSName("remote_fs".to_string()),
+            MountOption::AutoUnmount,
+            MountOption::AllowOther,
+        ],
+    ) {
         error!("Errore mount: {}", e);
     }
     info!("File system smontato in modo pulito. Terminazione del demone.");
