@@ -1,7 +1,7 @@
-use std::{path::PathBuf, num::NonZeroUsize};
+use std::{path::PathBuf, num::NonZeroUsize, time::{SystemTime, Duration}, collections::HashMap};
 use shared::file_entry::FileEntry;
 use crate::api::Api;
-use lru::LruCache; // Import necessario
+use lru::LruCache;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Inode(pub u64);
@@ -14,26 +14,36 @@ pub struct CachedFile {
 
 #[derive(Debug)]
 pub struct Cache {
-    // MODIFICA: HashMap -> LruCache
     pub files: LruCache<Inode, CachedFile>,
+    // Memorizza il contenuto della cartella e il timestamp di quando è stata scaricata
+    pub dir_cache: HashMap<String, (SystemTime, Vec<FileEntry>)>,
+    pub ttl: Duration,
     pub api: Api,
 }
 
 impl Cache {
-    // MODIFICA: Capacity configurabile
-    pub fn new(capacity: usize) -> Self {
+    //  TTL nel costruttore
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
         let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
         
-        // Inizializziamo la LRU
-        let mut files = LruCache::new(cap);
-        
-        // Non inseriamo root manualmente qui per semplicità con LRU, 
-        // verrà recuperata alla prima list_dir o lookup
-        
-        Self { files, api: Api::new() }
+        Self { 
+            files: LruCache::new(cap), 
+            dir_cache: HashMap::new(),
+            ttl,
+            api: Api::new() 
+        }
     }
 
     pub fn list_dir(&mut self, path: &str) -> Result<Vec<FileEntry>, std::io::Error> {
+        // Controlliamo se abbiamo già la cartella in memoria
+        if let Some((last_update, entries)) = self.dir_cache.get(path) {
+            // Se è passato meno tempo del TTL, rispondiamo subito con i dati in cache
+            if last_update.elapsed().unwrap_or(Duration::MAX) < self.ttl {
+                return Ok(entries.clone());
+            }
+        }
+
+        // Se non c'è, o il TTL è scaduto, chiamiamo l'API
         let entries = self.api.list_dir(path)?;
         let parent_path = PathBuf::from(path);
         
@@ -43,22 +53,29 @@ impl Cache {
             } else {
                 parent_path.join(&entry.name)
             };
-            // LRU put
             self.files.put(Inode(entry.ino), CachedFile {
                 file_entry: entry.clone(),
                 file_path: full_path,
             });
         }
+        
+        // Aggiorniamo la cache delle cartelle con il nuovo orario
+        self.dir_cache.insert(path.to_string(), (SystemTime::now(), entries.clone()));
+        
         Ok(entries)
     }
 
     pub fn get_file_by_ino(&mut self, ino: Inode) -> Option<CachedFile> {
-        // LRU get (promuove l'elemento come "usato di recente")
         self.files.get(&ino).cloned()
     }
     
-    // Metodo helper per peek senza alterare l'ordine LRU (opzionale)
     pub fn peek_file_by_ino(&self, ino: Inode) -> Option<CachedFile> {
         self.files.peek(&ino).cloned()
+    }
+
+    pub fn invalidate_dir(&mut self, path: &str) {
+        // Rimuove la cartella dalla cache, forzando un ricaricamento
+        // alla prossima chiamata a list_dir()
+        self.dir_cache.remove(path);
     }
 }

@@ -84,7 +84,7 @@ struct RemoteFS {
 
 impl RemoteFS {
     fn new(use_cache: bool, cache_capacity: usize, ttl_secs: u64) -> Self {
-        let mut cache = Cache::new(cache_capacity);
+        let mut cache = Cache::new(cache_capacity, Duration::from_secs(ttl_secs));
         
         // Inizializziamo manualmente la Root (Inode 1)
         cache.files.put(Inode(1), crate::cache::CachedFile {
@@ -123,18 +123,17 @@ impl Filesystem for RemoteFS {
     // METADATA 
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        // 1. Controllo se il file è aperto in scrittura (Dirty Read da buffer locale)
         if let Some(rfs_file) = self.rfs_files.get(&Inode(ino)) {
+            let mut attr = FileAttrWrapper::from(rfs_file.file_entry.clone()).0;
+            // Se il file è stato modificato localmente, prendiamo la dimensione reale dal disco
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
-                let mut attr = FileAttrWrapper::from(rfs_file.file_entry.clone()).0;
-                // Otteniamo la dimensione reale dal file temporaneo su disco
                 if let Ok(metadata) = rfs_file.write_buffer.as_ref().unwrap().as_file().metadata() {
                     attr.size = metadata.len();
                 }
                 attr.mtime = SystemTime::now(); 
-                reply.attr(&self.ttl, &attr);
-                return;
             }
+            reply.attr(&self.ttl, &attr);
+            return;
         }
         
         match self.cache.get_file_by_ino(Inode(ino)) {
@@ -206,8 +205,20 @@ impl Filesystem for RemoteFS {
         }
 
         match found {
-            Some((_, f)) => reply.entry(&self.ttl, &FileAttrWrapper::from(f.file_entry).0, 0),
-            None => reply.error(ENOENT),
+            Some((_, f)) => reply.entry(&Duration::from_secs(1), &FileAttrWrapper::from(f.file_entry).0, 0),
+            None => {
+                // Diciamo al Kernel: "Non c'è, ma non ricordartelo! Chiedimelo sempre."
+                reply.entry(&Duration::from_secs(0), &FileAttr { 
+                    ino: 0, size: 0, blocks: 0, atime: SystemTime::UNIX_EPOCH, 
+                    mtime: SystemTime::UNIX_EPOCH, ctime: SystemTime::UNIX_EPOCH, 
+                    crtime: SystemTime::UNIX_EPOCH, kind: FileType::RegularFile, 
+                    perm: 0, nlink: 0, uid: 0, gid: 0, rdev: 0, blksize: 0, flags: 0 
+                }, 0);
+                // Oppure, se la tua libreria lo supporta più semplicemente:
+                // reply.error(ENOENT); 
+                // Ma in molti ambienti FUSE3, se non mandi un entry con TTL 0, 
+                // lui usa un default di qualche secondo per il "negative cache".
+            }
         }
     }
 
@@ -238,13 +249,17 @@ impl Filesystem for RemoteFS {
         
         match self.cache.api.create_directory(&new_path) {
             Ok(_) => {
+                self.cache.dir_cache.remove(&parent_path);
                 let _ = self.cache.list_dir(&parent_path); 
                 let target_path = PathBuf::from(new_path);
                 
                 let found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(_, f)| f.clone());
                 match found {
-                    Some(f) => reply.entry(&self.ttl, &FileAttrWrapper::from(f.file_entry).0, 0),
-                    None => reply.error(EIO),
+                    Some(f) => reply.entry(&Duration::from_secs(1), &FileAttrWrapper::from(f.file_entry).0, 0),
+                    None => {
+                        self.cache.dir_cache.remove(&parent_path);
+                        reply.error(EIO)
+                    },
                 }
             },
             Err(_) => reply.error(EIO),
@@ -262,12 +277,16 @@ impl Filesystem for RemoteFS {
             return; 
         }
 
+        self.cache.dir_cache.remove(&parent_path);
         let _ = self.cache.list_dir(&parent_path);
         let found = self.cache.files.iter().find(|(_, f)| f.file_path == new_path).map(|(_, f)| f.clone());
 
         match found {
-            Some(cached) => reply.entry(&self.ttl, &FileAttrWrapper::from(cached.file_entry).0, 0),
-            None => reply.error(EIO),
+            Some(cached) => reply.entry(&Duration::from_secs(1), &FileAttrWrapper::from(cached.file_entry).0, 0),
+            None => {
+                self.cache.dir_cache.remove(&parent_path);
+                reply.error(EIO)
+            },
         }
     }
 
@@ -281,6 +300,7 @@ impl Filesystem for RemoteFS {
             reply.error(EIO); return; 
         }
         
+        self.cache.dir_cache.remove(&parent_path);
         let _ = self.cache.list_dir(&parent_path);
         let found = self.cache.files.iter().find(|(_, f)| f.file_path == new_path).map(|(_, f)| f.clone());
 
@@ -297,7 +317,7 @@ impl Filesystem for RemoteFS {
                 let entry_for_reply = rfs_file.file_entry.clone();
                 self.rfs_files.insert(ino, rfs_file);
                 
-                reply.created(&self.ttl, &FileAttrWrapper::from(entry_for_reply).0, 0, fd.0, 0);
+                reply.created(&Duration::from_secs(1), &FileAttrWrapper::from(entry_for_reply).0, 0, fd.0, 0);
             },
             None => reply.error(EIO),
         }
@@ -312,7 +332,7 @@ impl Filesystem for RemoteFS {
 
         let found_entry = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(_, f)| f.clone());
 
-        if let Some(cached) = found_entry {
+        if let Some(cached) = found_entry.clone() {
             let inode = Inode(cached.file_entry.ino);
             
             let is_open = if let Some(rfs_file) = self.rfs_files.get(&inode) {
@@ -341,7 +361,17 @@ impl Filesystem for RemoteFS {
         }
 
         match self.cache.api.delete_file_or_directory(&target_path_str) {
-            Ok(_) => reply.ok(),
+            Ok(_) => {
+                // rimuovi dalla cache locale
+                if let Some(cached) = found_entry {
+                    self.cache.files.pop(&Inode(cached.file_entry.ino));
+                }
+                self.cache.invalidate_dir(&parent_path);
+
+                //let _ = self.cache.list_dir(&parent_path);
+
+                reply.ok()
+            },
             Err(_) => reply.error(EIO),
         }
     }
@@ -350,10 +380,23 @@ impl Filesystem for RemoteFS {
         let parent_path = match self.get_path_str(Inode(parent)) {
             Some(p) => p, None => { reply.error(ENOENT); return; }
         };
-        let target = PathBuf::from(&parent_path).join(name).to_string_lossy().to_string();
+        let target_path = PathBuf::from(&parent_path).join(name);
+        let target = target_path.to_string_lossy().to_string();
         
         match self.cache.api.delete_file_or_directory(&target) {
-            Ok(_) => reply.ok(),
+            Ok(_) => {
+                // rimuovi la directory eliminata dalla cache locale
+                let found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(i, _)| *i);
+                if let Some(ino) = found {
+                    self.cache.files.pop(&ino);
+                }
+
+                // forza l'aggiornamento della cartella padre 
+                //let _ = self.cache.list_dir(&parent_path);
+                self.cache.invalidate_dir(&parent_path);
+
+                reply.ok()
+            },
             Err(_) => reply.error(ENOTEMPTY), 
         }
     }
@@ -364,7 +407,11 @@ impl Filesystem for RemoteFS {
         };
         let old_path = PathBuf::from(&parent_path).join(name).to_string_lossy().to_string();
         match self.cache.api.rename(&old_path, &new_name.to_string_lossy()) {
-            Ok(_) => reply.ok(), Err(_) => reply.error(EIO),
+            Ok(_) => {
+                self.cache.dir_cache.remove(&parent_path);
+                reply.ok()
+            }, 
+            Err(_) => reply.error(EIO),
         }
     }
 
@@ -488,6 +535,20 @@ impl Filesystem for RemoteFS {
                         reply.error(EIO);
                         return;
                     }
+                    
+                    // sincronizzazione cache e Metadati 
+                    if let Ok(meta) = temp_file.as_file().metadata() {
+                        rfs_file.file_entry.size = meta.len();
+                        rfs_file.file_entry.modified_at = meta.modified().unwrap_or(SystemTime::now());
+                        
+                        // aggiorna cache 
+                        if let Some(mut cached) = self.cache.files.get(&inode).cloned() {
+                            cached.file_entry.size = meta.len();
+                            cached.file_entry.modified_at = rfs_file.file_entry.modified_at;
+                            self.cache.files.put(inode, cached);
+                        }
+                    }
+                    
                     rfs_file.is_dirty = false;
                 } else {
                     reply.error(EIO);
@@ -508,7 +569,7 @@ impl Filesystem for RemoteFS {
 
             if rfs_file.fds.is_empty() {
                 if !rfs_file.is_dirty {
-                    rfs_file.write_buffer = None; // Chiude ed elimina tempfile
+                    rfs_file.write_buffer = None; // chiude ed elimina tempfile
                     rfs_file.read_buffer.clear();
                 }
                 if rfs_file.unlinked {

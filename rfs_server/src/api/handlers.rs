@@ -101,3 +101,70 @@ pub async fn rename_file_or_directory(path: SafePath, body: Json<RenameRequest>)
     fs::rename(full_path, new_path).await.map_err(|e| ErrorInternalServerError(e))?;
     Ok(HttpResponse::Ok().finish())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use actix_web::{test, web, App, http::StatusCode};
+    use std::env;
+    use std::fs;
+    use crate::api::config_routes;
+
+    const TEST_STORAGE: &str = "/tmp/rfs_storage_test_env";
+
+    // Prepara un ambiente pulito per i test
+    fn setup_test_env() {
+        // Diciamo al server di usare questa cartella temporanea per i test
+        env::set_var("RFS_STORAGE_PATH", TEST_STORAGE);
+        let _ = fs::remove_dir_all(TEST_STORAGE);
+        fs::create_dir_all(TEST_STORAGE).unwrap();
+    }
+
+    #[actix_web::test]
+    async fn test_create_and_list_directory() {
+        setup_test_env();
+        let app = test::init_service(App::new().configure(config_routes)).await;
+
+        let req_mkdir = test::TestRequest::post().uri("/api/mkdir/test_dir").to_request();
+        let resp_mkdir = test::call_service(&app, req_mkdir).await;
+        assert_eq!(resp_mkdir.status(), StatusCode::CREATED);
+
+        let req_list = test::TestRequest::get().uri("/api/list/").to_request();
+        let resp_list: Vec<shared::file_entry::FileEntry> = test::call_and_read_body_json(&app, req_list).await;
+        assert!(resp_list.iter().any(|entry| entry.name == "test_dir" && entry.is_dir));
+    }
+
+    #[actix_web::test]
+    async fn test_write_and_read_file() {
+        setup_test_env();
+        let app = test::init_service(App::new().configure(config_routes)).await;
+
+        let req_put = test::TestRequest::put()
+            .uri("/api/files/hello.txt")
+            .set_payload("Test data")
+            .to_request();
+        let resp_put = test::call_service(&app, req_put).await;
+        assert_eq!(resp_put.status(), StatusCode::CREATED);
+
+        let req_get = test::TestRequest::get().uri("/api/files/hello.txt").to_request();
+        let resp_body = test::call_and_read_body(&app, req_get).await;
+        assert_eq!(resp_body, web::Bytes::from_static(b"Test data"));
+    }
+
+    #[actix_web::test]
+    async fn test_delete_file() {
+        setup_test_env();
+        let app = test::init_service(App::new().configure(config_routes)).await;
+
+        let req_put = test::TestRequest::put().uri("/api/files/todelete.txt").set_payload("data").to_request();
+        test::call_service(&app, req_put).await;
+
+        let req_del = test::TestRequest::delete().uri("/api/files/todelete.txt").to_request();
+        let resp_del = test::call_service(&app, req_del).await;
+        assert_eq!(resp_del.status(), StatusCode::OK);
+
+        let req_check = test::TestRequest::get().uri("/api/files/todelete.txt").to_request();
+        let resp_check = test::call_service(&app, req_check).await;
+        assert_eq!(resp_check.status(), StatusCode::NOT_FOUND);
+    }
+}
