@@ -9,6 +9,7 @@ pub struct Api {
 }
 
 impl Api {
+    /// inizializza il client HTTP
     pub fn new() -> Self {
         Self {
             client: Client::new(),
@@ -16,7 +17,9 @@ impl Api {
         }
     }
 
+    /// restituisce la lista dei file in una directory, o un errore se la directory non esiste o c'è un problema di rete
     pub fn list_dir(&self, path: &str) -> Result<Vec<FileEntry>, Error> {
+        // costruisce l'indirizzo hhtp per la richiesta al server
         let url = format!("{}list{}", self.base_url, path);
         let resp = self.client.get(&url).send().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
         
@@ -26,7 +29,9 @@ impl Api {
         resp.json::<Vec<FileEntry>>().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))
     }
 
+    /// legge un intervallo di byte da un file specificato da path, restituendo i dati o un errore se il file non esiste o c'è un problema di rete
     pub fn read_file_contents(&self, path: &str, offset: u64, size: u32) -> Result<Vec<u8>, Error> {
+        // range di bytes da leggere (offset= da dove partire, size= quanti byte leggere)
         let end = offset + size as u64 - 1;
         let url = format!("{}files{}", self.base_url, path);
         
@@ -42,11 +47,12 @@ impl Api {
         }
     }
 
-   // Accetta un generic 'R' che implementa Read + Send (es. File)
+    /// scrive i dati in un file specificato da path, restituendo un errore se il file non esiste o c'è un problema di rete
     pub fn write_file<R: Read + Send + 'static>(&self, path: &str, data: R) -> Result<(), Error> {
         let url = format!("{}files{}", self.base_url, path);
         
         // Reqwest blocking supporta il passaggio diretto di un Reader nel Body
+        // un Reader è un oggetto che implementa la lettura di dati, e può essere usato per inviare dati di grandi dimensioni senza doverli caricare tutti in ram. 
         let resp = self.client.put(&url)
             .body(reqwest::blocking::Body::new(data))
             .send()
@@ -55,18 +61,21 @@ impl Api {
         if resp.status().is_success() { Ok(()) } else { Err(ErrorKind::Other.into()) }
     }
 
+    /// crea una nuova directory specificata da path
     pub fn create_directory(&self, path: &str) -> Result<(), Error> {
         let url = format!("{}mkdir{}", self.base_url, path);
         let resp = self.client.post(&url).send().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
         if resp.status().is_success() { Ok(()) } else { Err(ErrorKind::Other.into()) }
     }
 
+    /// elimina un file o una directory specificata da path
     pub fn delete_file_or_directory(&self, path: &str) -> Result<(), Error> {
         let url = format!("{}files{}", self.base_url, path);
         let resp = self.client.delete(&url).send().map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
         if resp.status().is_success() { Ok(()) } else { Err(ErrorKind::Other.into()) }
     }
 
+    /// rinomina un file o una directory specificata da path con un nuovo nome new_name
     pub fn rename(&self, path: &str, new_name: &str) -> Result<(), Error> {
         let url = format!("{}files{}", self.base_url, path);
         let body = serde_json::json!({ "new_name": new_name });
