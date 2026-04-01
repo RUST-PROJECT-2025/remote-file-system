@@ -10,6 +10,7 @@ impl OpenFlags {
     pub const READ: OpenFlags = OpenFlags(1);
     pub const WRITE: OpenFlags = OpenFlags(2);
     
+    /// Converte i flag di apertura di FUSE (O_RDONLY, O_WRONLY, O_RDWR) in OpenFlags personalizzati (WRITE o READ)
     pub fn from_flags(flags: i32) -> Self {
         let acc_mode = flags & libc::O_ACCMODE;
         if acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR {

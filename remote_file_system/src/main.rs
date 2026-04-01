@@ -13,10 +13,10 @@ use std::{
     ffi::OsStr,
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
 };
+use log:: {debug};
 
 mod api;
 mod cache;
@@ -27,9 +27,10 @@ use crate::{
     file::{OpenFlags, OpenedFile, RfsFile},
 };
 
-const PREFETCH_SIZE: u32 = 5 * 1024 * 1024; // 5 MB Read Ahead
+// 5 MB Read Ahead
+const PREFETCH_SIZE: u32 = 5 * 1024 * 1024; 
 
-// --- CLI ARGUMENTS ---
+// CLI ARGUMENTS 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -41,15 +42,15 @@ struct Args {
     #[arg(long)]
     no_cache: bool,
 
-    /// Dimensione massima cache LRU (numero di file)
+    /// Dimensione massima cache LRU 
     #[arg(long, default_value_t = 1000)]
     cache_capacity: usize,
 
-    /// TTL metadati cache in secondi
+    /// TTL cache in secondi
     #[arg(long, default_value_t = 1)]
     ttl: u64,
 
-    /// Esegui in background (daemon mode)
+    /// daemon mode
     #[arg(long)]
     daemon: bool,
 }
@@ -86,6 +87,7 @@ impl From<FileEntry> for FileAttrWrapper {
 
 struct RemoteFS {
     cache: Cache,
+    /// tiene traccia dei file aperti
     rfs_files: HashMap<Inode, RfsFile>,
     last_fd: AtomicU64,
     // Configurazioni
@@ -122,10 +124,13 @@ impl RemoteFS {
         }
     }
 
+    /// alloca un nuovo file descriptor univoco per ogni apertura di file, incrementando un contatore 
     fn alloc_fd(&self) -> Fd {
         Fd(self.last_fd.fetch_add(1, Ordering::SeqCst))
     }
 
+    /// dato l'Inode, ritorna il path completo del file. 
+    /// Serve principalmente per tradurre le richieste FUSE (Inode) in operazioni sui path da mandare al server.
     fn get_path_str(&mut self, ino: Inode) -> Option<String> {
         // Gestione speciale Root
         if ino.0 == 1 {
@@ -140,10 +145,13 @@ impl RemoteFS {
 impl Filesystem for RemoteFS {
     // METADATA
 
+    /// ritorna i metadati specificando l'Inode del file
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+
+        // controllo se il file richiesto è tra quelli attualmente aperti
         if let Some(rfs_file) = self.rfs_files.get(&Inode(ino)) {
             let mut attr = FileAttrWrapper::from(rfs_file.file_entry.clone()).0;
-            // Se il file è stato modificato localmente, prendiamo la dimensione reale dal disco
+            // Se il file è stato modificato localmente(dirty + qualcosa nel buffer), prendiamo la dimensione reale dal disco
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
                 if let Ok(metadata) = rfs_file.write_buffer.as_ref().unwrap().as_file().metadata() {
                     attr.size = metadata.len();
@@ -154,6 +162,7 @@ impl Filesystem for RemoteFS {
             return;
         }
 
+        // il file richiesto non è tra quelli aperti, cerchiamo nella cache
         match self.cache.get_file_by_ino(Inode(ino)) {
             Some(f) => reply.attr(&self.ttl, &FileAttrWrapper::from(f.file_entry).0),
             None => reply.error(ENOENT),
@@ -164,6 +173,8 @@ impl Filesystem for RemoteFS {
         reply.ok();
     }
 
+    /// invocata dal kernel quando vuole modificare i metadati di un file
+    /// ci interessa principalmente per gestire i resize dei file
     fn setattr(
         &mut self,
         _req: &Request<'_>,
@@ -184,39 +195,31 @@ impl Filesystem for RemoteFS {
     ) {
         let inode = Inode(ino);
         if let Some(new_size) = size {
+            debug!("FUSE SETATTR: Truncate Inode {} alla nuova dimensione: {} byte", ino, new_size);
+
+            // cerco nei file aperti
             if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
                 // Inizializza buffer su disco se non esiste
                 if rfs_file.write_buffer.is_none() {
                     rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
                 }
-                // Truncate del file temporaneo
+                // Truncate direttamente sul file temporaneo
                 let file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
                 if file.set_len(new_size).is_ok() {
                     rfs_file.is_dirty = true;
                     rfs_file.file_entry.size = new_size;
                 }
+            } else {
+            
+                debug!("FUSE SETATTR: Fallimento truncate locale per Inode {}", ino);
             }
+        } else {
+            debug!("FUSE SETATTR: Richiesto truncate su Inode {} ma il file non è nei rfs_files (non aperto)", ino);
         }
+        // restituisco i metadati aggiornati 
         self.getattr(_req, ino, None, reply);
     }
 
-    /*fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
-        };
-
-        // Refresh directory
-        let _ = self.cache.list_dir(&parent_path);
-
-        let target_path = PathBuf::from(&parent_path).join(name.to_string_lossy().as_ref());
-
-        let found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(i, f)| (*i, f.clone()));
-
-        match found {
-            Some((_, f)) => reply.entry(&self.ttl, &FileAttrWrapper::from(f.file_entry).0, 0),
-            None => reply.error(ENOENT),
-        }
-    }*/
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_path = match self.get_path_str(Inode(parent)) {
@@ -239,6 +242,9 @@ impl Filesystem for RemoteFS {
 
         // Se non c'è, ALLORA scarichiamo dal server
         if found.is_none() {
+
+            debug!("FUSE LOOKUP: Cache miss per '{}', forzo list_dir sul server", target_path.display());
+
             let _ = self.cache.list_dir(&parent_path);
             found = self
                 .cache
@@ -250,12 +256,12 @@ impl Filesystem for RemoteFS {
 
         match found {
             Some((_, f)) => reply.entry(
-                &Duration::from_secs(1),
+                &self.ttl,
                 &FileAttrWrapper::from(f.file_entry).0,
                 0,
             ),
             None => {
-                // Diciamo al Kernel: "Non c'è, ma non ricordartelo! Chiedimelo sempre."
+                // Diciamo al Kernel: "Non c'è, ma non ricordartelo! Chiedimelo sempre."  --> per bug di Negative Cache
                 reply.entry(
                     &Duration::from_secs(0),
                     &FileAttr {
@@ -277,14 +283,12 @@ impl Filesystem for RemoteFS {
                     },
                     0,
                 );
-                // Oppure, se la tua libreria lo supporta più semplicemente:
-                // reply.error(ENOENT);
-                // Ma in molti ambienti FUSE3, se non mandi un entry con TTL 0,
-                // lui usa un default di qualche secondo per il "negative cache".
             }
         }
     }
 
+    /// elenca tutte le cartelle ed i file di una directory. 
+    /// Viene invocata dal kernel quando un processo fa ls o simili.
     fn readdir(
         &mut self,
         _req: &Request<'_>,
@@ -315,12 +319,16 @@ impl Filesystem for RemoteFS {
                 }
                 reply.ok();
             }
-            Err(_) => reply.error(EIO),
+            Err(e) => {
+                error!("FUSE READDIR: Fallimento lettura cartella '{}': {}", path, e);
+                reply.error(EIO);
+            }
         }
     }
 
     // --- CREAZIONE / RIMOZIONE ---
 
+    /// crea una nuova directory
     fn mkdir(
         &mut self,
         _req: &Request<'_>,
@@ -342,8 +350,13 @@ impl Filesystem for RemoteFS {
             .to_string_lossy()
             .to_string();
 
+        info!("FUSE MKDIR: Creazione directory '{}'", new_path);
+
         match self.cache.api.create_directory(&new_path) {
             Ok(_) => {
+                debug!("FUSE MKDIR: Successo remoto. Risincronizzazione cache per '{}'", parent_path);
+
+                // forza l'aggiornamento della cartella padre per far vedere la nuova directory
                 self.cache.dir_cache.remove(&parent_path);
                 let _ = self.cache.list_dir(&parent_path);
                 let target_path = PathBuf::from(new_path);
@@ -354,22 +367,31 @@ impl Filesystem for RemoteFS {
                     .iter()
                     .find(|(_, f)| f.file_path == target_path)
                     .map(|(_, f)| f.clone());
+
                 match found {
                     Some(f) => reply.entry(
-                        &Duration::from_secs(1),
+                        &self.ttl,
                         &FileAttrWrapper::from(f.file_entry).0,
                         0,
                     ),
                     None => {
+                        // ERROR: Disallineamento grave tra server e client --> la directory è stata creata sul server ma non riesco a trovarla in cache. 
+                        // Forzo invalidazione e rispondo con errore.
+                        error!("FUSE MKDIR: Directory creata ma invisibile al server durante il refresh");
                         self.cache.dir_cache.remove(&parent_path);
                         reply.error(EIO)
                     }
                 }
             }
-            Err(_) => reply.error(EIO),
+            Err(e) => {
+                // ERROR: Fallimento della chiamata API
+                error!("FUSE MKDIR: Fallimento API per '{}': {}", new_path, e);
+                reply.error(EIO)
+            } 
         }
     }
 
+    /// crea un nuovo file vuoto, ad esempio touch nuovo_file.txt
     fn mknod(
         &mut self,
         _req: &Request<'_>,
@@ -389,16 +411,18 @@ impl Filesystem for RemoteFS {
         };
         let new_path = PathBuf::from(&parent_path).join(name);
 
-        if self
-            .cache
-            .api
-            .write_file(&new_path.to_string_lossy(), std::io::empty())
-            .is_err()
-        {
+        info!("FUSE MKNOD: Creazione nuovo file vuoto '{}'", new_path .to_string_lossy().to_string());
+
+        // fa la PUT con body vuoto
+        if let Err(e) = self.cache.api.write_file(&new_path.to_string_lossy(), std::io::empty()) {
+            error!("FUSE MKNOD: Fallimento API durante la creazione di '{}': {}", new_path.to_string_lossy(), e);
             reply.error(EIO);
             return;
         }
 
+        debug!("FUSE MKNOD: Successo remoto. Sincronizzazione cache per la directory padre");
+
+        // forza l'aggiornamento della cartella padre per far vedere il nuovo file
         self.cache.dir_cache.remove(&parent_path);
         let _ = self.cache.list_dir(&parent_path);
         let found = self
@@ -410,17 +434,19 @@ impl Filesystem for RemoteFS {
 
         match found {
             Some(cached) => reply.entry(
-                &Duration::from_secs(1),
+                &self.ttl,
                 &FileAttrWrapper::from(cached.file_entry).0,
                 0,
             ),
             None => {
+                error!("FUSE MKNOD: File '{}' creato ma invisibile al server durante il refresh", new_path.to_string_lossy());
                 self.cache.dir_cache.remove(&parent_path);
                 reply.error(EIO)
             }
         }
     }
 
+    /// crea un file, lo apre e ci scrive dentro i dati passati in fase di creazione (ad esempio echo "Ciao" > nuovo_file.txt)
     fn create(
         &mut self,
         _req: &Request<'_>,
@@ -440,18 +466,21 @@ impl Filesystem for RemoteFS {
         };
         let new_path = PathBuf::from(&parent_path).join(name);
 
-        if self
-            .cache
-            .api
-            .write_file(&new_path.to_string_lossy(), std::io::empty())
-            .is_err()
-        {
+        info!("FUSE CREATE: Creazione e apertura simultanea di '{}'", new_path.to_string_lossy().to_string());
+
+        // crea il file vuoto 
+        if let Err(e) = self.cache.api.write_file(&new_path.to_string_lossy(), std::io::empty()) {
+            error!("FUSE CREATE: Fallimento API per '{}': {}", new_path.to_string_lossy().to_string(), e);
             reply.error(EIO);
             return;
         }
 
+        debug!("FUSE CREATE: Creazione remota completata. Sincronizzazione cache in corso...");
+
+        // aggiorno la cache per far vedere il nuovo file, ricarica la lista per ottenere il nuovo Inode remoto
         self.cache.dir_cache.remove(&parent_path);
         let _ = self.cache.list_dir(&parent_path);
+        // cerco il file appena creato nella cache per ottenere i suoi metadati e poterlo aprire subito
         let found = self
             .cache
             .files
@@ -460,11 +489,16 @@ impl Filesystem for RemoteFS {
             .map(|(_, f)| f.clone());
 
         match found {
+            // se trovo il file lo apro
             Some(cached) => {
+                // creao un nuovo fd per il processo che sta "usando" il file
                 let fd = self.alloc_fd();
                 let ino = Inode(cached.file_entry.ino);
                 let mut rfs_file = RfsFile::from(cached);
 
+                debug!("FUSE CREATE: Assegnato Fd {} all'Inode {}", fd.0, ino.0);
+
+                // inserisco il nuovo fd tra quelli che hanno il file aperto, con flag di scrittura 
                 rfs_file.fds.insert(
                     fd,
                     OpenedFile {
@@ -473,24 +507,33 @@ impl Filesystem for RemoteFS {
                         flags: OpenFlags::WRITE,
                     },
                 );
+                // creo un buffer di scrittura temporaneo per tenere i dati in attesa di flush sul server
                 rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
                 rfs_file.is_dirty = true;
 
                 let entry_for_reply = rfs_file.file_entry.clone();
+                // inserisco il file tra quelli aperti
                 self.rfs_files.insert(ino, rfs_file);
 
                 reply.created(
-                    &Duration::from_secs(1),
+                    &self.ttl,
                     &FileAttrWrapper::from(entry_for_reply).0,
                     0,
                     fd.0,
                     0,
                 );
             }
-            None => reply.error(EIO),
+            None => {
+                error!("FUSE CREATE: File '{}' creato ma non trovato nel successivo refresh", new_path.to_string_lossy().to_string());
+                reply.error(EIO)
+            },
         }
     }
 
+    /// gestisce la cancellazione di un file
+    /// se elimini un file mentre un programma lo sta ancora leggendo o scrivendo, 
+    /// il sistema operativo rimuove il nome dalla cartella, ma non cancella fisicamente i dati dal disco 
+    /// finché il programma non chiude il file
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let parent_path = match self.get_path_str(Inode(parent)) {
             Some(p) => p,
@@ -509,6 +552,8 @@ impl Filesystem for RemoteFS {
             .find(|(_, f)| f.file_path == target_path)
             .map(|(_, f)| f.clone());
 
+        // controllo se l'Inode si trova nella mappa dei file aperti
+        // e se ha almeno un fd "attivo"
         if let Some(cached) = found_entry.clone() {
             let inode = Inode(cached.file_entry.ino);
 
@@ -518,7 +563,10 @@ impl Filesystem for RemoteFS {
                 false
             };
 
+            // se è così non lo elimino subito dal server (verrà eliminato nella release quando si chiuderà l'ultimo fd)
             if is_open {
+                // ma lo rinomino, nascondendolo all'utente
+                // In Linux, i file che iniziano col punto sono nascosti
                 let new_name = format!(".deleted_{}_{}", inode.0, name.to_string_lossy());
                 info!(
                     "Unlink su file aperto (ino={}). Rename -> {}",
@@ -534,28 +582,38 @@ impl Filesystem for RemoteFS {
                         let _ = self.cache.list_dir(&parent_path);
                         reply.ok();
                     }
-                    Err(_) => reply.error(EIO),
+                    Err(e) => {
+                        error!("FUSE UNLINK: Errore API rename per soft delete: {}", e);
+                        reply.error(EIO)
+                    },
                 }
                 return;
             }
         }
 
+        // il file non è aperto da nessuno, posso eliminarlo subito dal server
+
+        info!("FUSE UNLINK: Eliminazione fisica del file '{}'", target_path_str);
         match self.cache.api.delete_file_or_directory(&target_path_str) {
             Ok(_) => {
-                // rimuovi dalla cache locale
+                // rimuovi dalla cache locale dei file
                 if let Some(cached) = found_entry {
+                    debug!("FUSE UNLINK: Rimozione Inode {} dalla cache LRU", cached.file_entry.ino);
                     self.cache.files.pop(&Inode(cached.file_entry.ino));
                 }
+                // invalido la cache della directory padre
                 self.cache.invalidate_dir(&parent_path);
-
-                //let _ = self.cache.list_dir(&parent_path);
 
                 reply.ok()
             }
-            Err(_) => reply.error(EIO),
+            Err(e) => {
+                error!("FUSE UNLINK: Fallimento API DELETE per '{}': {}", target_path_str, e);
+                reply.error(EIO)
+            },
         }
     }
 
+    /// cancella una directory, solo se questa è vuota
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let parent_path = match self.get_path_str(Inode(parent)) {
             Some(p) => p,
@@ -567,6 +625,9 @@ impl Filesystem for RemoteFS {
         let target_path = PathBuf::from(&parent_path).join(name);
         let target = target_path.to_string_lossy().to_string();
 
+        info!("FUSE RMDIR: Eliminazione directory '{}'", target);
+
+        // cancella la directory solo se è vuota (controllo gestito nel backend), altrimenti ritorna ENOTEMPTY
         match self.cache.api.delete_file_or_directory(&target) {
             Ok(_) => {
                 // rimuovi la directory eliminata dalla cache locale
@@ -576,71 +637,122 @@ impl Filesystem for RemoteFS {
                     .iter()
                     .find(|(_, f)| f.file_path == target_path)
                     .map(|(i, _)| *i);
+
                 if let Some(ino) = found {
+                    debug!("FUSE RMDIR: Rimozione Inode {} (directory) dalla cache LRU", ino.0);
                     self.cache.files.pop(&ino);
                 }
 
                 // forza l'aggiornamento della cartella padre
-                //let _ = self.cache.list_dir(&parent_path);
+                debug!("FUSE RMDIR: Invalidazione cache per la directory padre '{}'", parent_path);
                 self.cache.invalidate_dir(&parent_path);
 
                 reply.ok()
             }
-            Err(_) => reply.error(ENOTEMPTY),
+            Err(e) => {
+                error!("FUSE RMDIR: Fallimento API DELETE per '{}': {}", target, e);
+                reply.error(ENOTEMPTY)
+            },
         }
     }
 
-    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, new_parent: u64, new_name: &OsStr, _flags: u32, reply: ReplyEmpty) {
+    /// rinomina un file o una directory, eventualmente spostandolo in un'altra cartella
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
         let parent_path = match self.get_path_str(Inode(parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
         let new_parent_path = match self.get_path_str(Inode(new_parent)) {
-            Some(p) => p, None => { reply.error(ENOENT); return; }
+            Some(p) => p,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         };
-        
-        let old_path = PathBuf::from(&parent_path).join(name).to_string_lossy().to_string();
-        
+
+        let old_path = PathBuf::from(&parent_path)
+            .join(name)
+            .to_string_lossy()
+            .to_string();
+
         let new_name_str = new_name.to_string_lossy().to_string();
-        
+
         let new_full_path = PathBuf::from(&new_parent_path).join(new_name);
 
+        info!("FUSE RENAME: '{}' -> '{}'", old_path, new_full_path.display());
         // passiamo new_name_str all'API
         match self.cache.api.rename(&old_path, &new_name_str) {
             Ok(_) => {
+                // se l'operazione di rename è andata a buon fine, aggiorniamo la cache locale per riflettere il cambiamento
                 let target_path = PathBuf::from(&parent_path).join(name);
-                
+
                 // cerchiamo il vecchio file in cache
-                let found = self.cache.files.iter().find(|(_, f)| f.file_path == target_path).map(|(i, _)| *i);
+                let found = self
+                    .cache
+                    .files
+                    .iter()
+                    .find(|(_, f)| f.file_path == target_path)
+                    .map(|(i, _)| *i);
+
                 if let Some(ino) = found {
+                    debug!("FUSE RENAME: Rimozione vecchio percorso dalla cache LRU (Inode {})", ino.0);
                     // rimuoviamo dai metadati cache
                     self.cache.files.pop(&ino);
-                    
+
                     // aggiorniamo il file path anche in rfs_files se è aperto
                     if let Some(rfs_file) = self.rfs_files.get_mut(&ino) {
+                        debug!("FUSE RENAME: Aggiornamento percorso file aperto in RAM (Inode {})", ino.0);
                         rfs_file.file_path = new_full_path.clone();
                     }
                 }
 
                 // invalidiamo le cartelle per forzare il server a mandare i dati nuovi
+                // invalido il padre attuale
+                debug!("FUSE RENAME: Invalidazione cache directory sorgente '{}'", parent_path);
                 self.cache.invalidate_dir(&parent_path);
+
+                // se il file è stato spostato in un'altra cartella, invalido anche la cartella di destinazione
                 if parent_path != new_parent_path {
+                    debug!("FUSE RENAME: Invalidazione cache directory destinazione '{}'", new_parent_path);
                     self.cache.invalidate_dir(&new_parent_path);
                 }
-                
+
                 reply.ok()
-            }, 
-            Err(_) => reply.error(EIO),
+            }
+            Err(e) => {
+                error!("FUSE RENAME: Fallimento API per rinomina '{}' -> '{}': {}", old_path, new_name_str, e);
+                reply.error(EIO)
+            },
         }
     }
 
     // IO
 
+    /// apre un file, restituendo un fd che il kernel userà per le operazioni successive di lettura/scrittura
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let inode = Inode(ino);
+        // prendo il file cachato corrispondente all'Inode richiesto
         if let Some(cached) = self.cache.get_file_by_ino(inode) {
             let fd = self.alloc_fd();
             let open_flags = OpenFlags::from_flags(flags);
+
+            debug!("FUSE OPEN: Allocato Fd {} per Inode {} (Modalità: {:?})", fd.0, ino, open_flags);
+            // cerca l'Inode nella mappa dei file aperti, se non c'è lo inserisce con i metadati presi dalla cache
             let rfs_file = self.rfs_files.entry(inode).or_insert(RfsFile::from(cached));
+     
+            // inserisco il nuovo fd nella mappa dei fd che hanno il file aperto, con i flag di apertura corretti
             rfs_file.fds.insert(
                 fd,
                 OpenedFile {
@@ -650,15 +762,20 @@ impl Filesystem for RemoteFS {
                 },
             );
 
+            // se la modalità è "WRITE" e non esiste ancora un buffer di scrittura, 
+            // lo creo per tenere i dati in attesa di flush sul server
             if open_flags.is_write() && rfs_file.write_buffer.is_none() {
+                debug!("FUSE OPEN: Modalità scrittura rilevata per Fd {}, creato nuovo write_buffer locale", fd.0);
                 rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
             }
             reply.opened(fd.0, 0);
         } else {
+            debug!("FUSE OPEN: Fallimento, Inode {} non trovato in cache", ino);
             reply.error(ENOENT);
         }
     }
 
+    /// legge il contenuto di un file aperto
     fn read(
         &mut self,
         _req: &Request<'_>,
@@ -673,14 +790,18 @@ impl Filesystem for RemoteFS {
         let inode = Inode(ino);
 
         if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
+            // se il file è stato modificato localmente (dirty) e ha un buffer di scrittura, 
+            // leggo i dati direttamente da quel buffer per garantire la coerenza dei dati letti
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
                 let temp_file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
+                // posiziono il cursore del file temporaneo alla posizione richiesta
                 if temp_file.seek(SeekFrom::Start(offset as u64)).is_err() {
                     reply.error(EIO);
                     return;
                 }
 
                 let mut buf = vec![0u8; size as usize];
+                // leggo i dati richiesti dal file temporaneo
                 match temp_file.read(&mut buf) {
                     Ok(n) => reply.data(&buf[0..n]),
                     Err(_) => reply.error(EIO),
@@ -689,9 +810,11 @@ impl Filesystem for RemoteFS {
             }
         }
 
+        // se il file non è stato modificato localmente, o non ha un buffer di scrittura, procedo con la lettura normale
         let rfs_file = match self.rfs_files.get_mut(&inode) {
             Some(f) => f,
             None => {
+                // se per qualche motivo il file non è tra quelli aperti, provo a recuperarlo dalla cache 
                 if let Some(cached) = self.cache.get_file_by_ino(inode) {
                     self.rfs_files.insert(inode, RfsFile::from(cached));
                     self.rfs_files.get_mut(&inode).unwrap()
@@ -707,17 +830,24 @@ impl Filesystem for RemoteFS {
         let buf_start = rfs_file.read_buffer_offset;
         let buf_end = buf_start + rfs_file.read_buffer.len() as u64;
 
+        // se la richiesta di lettura è completamente soddisfabile con i dati già presenti nel buffer di lettura, 
+        // restituisco i dati direttamente da lì senza fare ulteriori chiamate al server
         if req_start >= buf_start && req_end <= buf_end {
             let slice_start = (req_start - buf_start) as usize;
             let slice_end = (req_end - buf_start) as usize;
             reply.data(&rfs_file.read_buffer[slice_start..slice_end]);
             return;
         }
-
+        
+        // se la richiesta di lettura non è completamente soddisfabile con i dati presenti nel buffer
+        // dobbiamo chiedere i dati al server. 
+        // Per ottimizzare le prestazioni, invece di chiedere solo i dati strettamente necessari per soddisfare la richiesta,
+        // chiediamo un blocco di dati più grande, partendo dall'offset richiesto, in modo da avere già in cache i dati per 
+        // eventuali letture future che si sovrappongono a questo intervallo.
         let fetch_size = cmp::max(size, PREFETCH_SIZE);
         let path = rfs_file.file_path.to_str().unwrap().to_string();
 
-        info!("Prefetching ino={} offset={}", ino, req_start);
+        debug!("FUSE READ: Prefetch MISS. Fetch rete per Inode {} (offset: {}, fetch_size: {})", ino, req_start, fetch_size);
 
         match self
             .cache
@@ -725,17 +855,23 @@ impl Filesystem for RemoteFS {
             .read_file_contents(&path, req_start, fetch_size)
         {
             Ok(data) => {
+                // scrivo i dati appena letti dal server nel buffer di lettura del file
                 rfs_file.read_buffer = data;
+                // aggiornando anche l'offset del buffer
                 rfs_file.read_buffer_offset = req_start;
 
                 let available = rfs_file.read_buffer.len();
                 let slice_len = cmp::min(size as usize, available);
                 reply.data(&rfs_file.read_buffer[0..slice_len]);
             }
-            Err(_) => reply.error(EIO),
+            Err(e) => {
+                error!("FUSE READ: Fallimento fetch rete per Inode {}: {}", ino, e);
+                reply.error(EIO)
+            }
         }
     }
 
+    /// scrive i dati in un file aperto
     fn write(
         &mut self,
         _req: &Request<'_>,
@@ -748,24 +884,31 @@ impl Filesystem for RemoteFS {
         _lock: Option<u64>,
         reply: ReplyWrite,
     ) {
+        // se il file è tra quelli aperti, procedo con la scrittura
         if let Some(rfs_file) = self.rfs_files.get_mut(&Inode(ino)) {
+            // se non c'è un buffer di scrittura, lo creo per tenere i dati in attesa di flush sul server
             if rfs_file.write_buffer.is_none() {
                 rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
             }
 
+            // riferimento mutabile al file temporaneo 
             let file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
 
+            // posiziono il cursore del file temporaneo alla posizione richiesta per la scrittura
             if file.seek(SeekFrom::Start(offset as u64)).is_err() {
                 reply.error(EIO);
                 return;
             }
+            // scrivo i dati passati in fase di scrittura nel file temporaneo
             if file.write_all(data).is_err() {
                 reply.error(EIO);
                 return;
             }
 
+            // segno il file come "dirty", cioè modificato localmente
             rfs_file.is_dirty = true;
             if let Ok(meta) = file.metadata() {
+                // aggiorno la dimensione del file 
                 rfs_file.file_entry.size = meta.len();
             }
 
@@ -775,22 +918,35 @@ impl Filesystem for RemoteFS {
         }
     }
 
+    /// chiamata dal kernel quando un file viene chiuso 
     fn flush(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, _lock: u64, reply: ReplyEmpty) {
         let inode = Inode(ino);
+
+        // vedo se il file è tra quelli aperti
         if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
+            // se il file è stato modificato localmente (dirty) e ha un buffer di scrittura,
+            // è necessario fare il flush dei dati sul server per garantire la persistenza delle modifiche e la coerenza dei dati
             if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
                 let temp_file = rfs_file.write_buffer.as_mut().unwrap();
                 let path = rfs_file.file_path.to_string_lossy().to_string();
 
+                // per fare il flush, riapro il file temporaneo in modalità lettura e 
+                // passo quel reader all'API di scrittura del server,
+                // in modo da inviare i dati modificati al server
                 if let Ok(reader) = temp_file.reopen() {
-                    info!("Streaming flush: {}", path);
+                    info!("FUSE FLUSH: Avvio streaming upload al server per '{}'", path);
+                    // scrivo sul server
                     if self.cache.api.write_file(&path, reader).is_err() {
+                        error!("FUSE FLUSH: Fallimento upload API per '{}'", path);
                         reply.error(EIO);
                         return;
                     }
 
+                    debug!("FUSE FLUSH: Upload completato con successo. Sincronizzazione metadati per Inode {}", ino);
+
                     // sincronizzazione cache e Metadati
                     if let Ok(meta) = temp_file.as_file().metadata() {
+                        // aggiorno il file aperto
                         rfs_file.file_entry.size = meta.len();
                         rfs_file.file_entry.modified_at =
                             meta.modified().unwrap_or(SystemTime::now());
@@ -802,9 +958,11 @@ impl Filesystem for RemoteFS {
                             self.cache.files.put(inode, cached);
                         }
                     }
-
+                    
+                    // resetto il flag
                     rfs_file.is_dirty = false;
                 } else {
+                    error!("FUSE FLUSH: Fallimento reopen del file temporaneo locale per Inode {}", ino);
                     reply.error(EIO);
                     return;
                 }
@@ -813,6 +971,8 @@ impl Filesystem for RemoteFS {
         reply.ok();
     }
 
+    /// si occupa di fare "pulizia" (restituire le risorse al sistema)
+    /// e gestisce la cancellazione ritardata dei file che sono stati eliminati mentre erano ancora aperti da qualche processo
     fn release(
         &mut self,
         _req: &Request<'_>,
@@ -825,26 +985,46 @@ impl Filesystem for RemoteFS {
     ) {
         let inode = Inode(ino);
         let mut should_delete = false;
+        let mut is_completely_closed = false;
         let mut delete_path = String::new();
 
         if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
+            // rimuovo il fd dalla lista dei fd che hanno il file aperto
             rfs_file.fds.remove(&Fd(fh));
 
+            // se la mappa è vuota, vuol dire che nessuno ha più questo file aperto, 
+            // quindi posso fare la pulizia dei buffer e, se il file era stato eliminato (unlinked), 
+            // procedere con la cancellazione fisica dal server
             if rfs_file.fds.is_empty() {
+                is_completely_closed = true;
+                debug!("FUSE RELEASE: Nessun altro processo usa l'Inode {}. Pulizia risorse locali.", ino);
+                // se nel buffer non c'è nulla, chiudo ed elimio il tempfile
                 if !rfs_file.is_dirty {
                     rfs_file.write_buffer = None; // chiude ed elimina tempfile
                     rfs_file.read_buffer.clear();
+                } else {
+                    debug!("FUSE RELEASE: L'Inode {} chiuso risulta ancora 'dirty'. Possibile mancato salvataggio!", ino);
                 }
+                // se il file era stato eliminato mentre era ancora aperto,
+                // ora che è stato chiuso da tutti i processi, posso eliminarlo fisicamente dal server
                 if rfs_file.unlinked {
                     should_delete = true;
                     delete_path = rfs_file.file_path.to_string_lossy().to_string();
+                    debug!("FUSE RELEASE: Trovato flag 'unlinked' per Inode {}. Preparazione Hard Delete.", ino);
                 }
             }
         }
 
+        // elimini definitivamente il file chiamando l'API
         if should_delete {
-            info!("Final delete (delayed): {}", delete_path);
-            let _ = self.cache.api.delete_file_or_directory(&delete_path);
+            info!("FUSE RELEASE: Final delete (delayed) per: {}", delete_path);
+
+            if let Err(e) = self.cache.api.delete_file_or_directory(&delete_path) {
+                error!("FUSE RELEASE: Errore critico. Impossibile eliminare dal server '{}': {}", delete_path, e);
+            }
+        } 
+        // se il file è completamente chiuso, rimuovo l'Inode dalla mappa dei file aperti per liberare memoria
+        if is_completely_closed {
             self.rfs_files.remove(&inode);
         }
 
@@ -857,6 +1037,7 @@ fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
         .init();
+
 
     let args = Args::parse();
     let mountpoint = args.mount_point.clone();
@@ -878,15 +1059,10 @@ fn main() {
         }
     }
 
-    //let mp_clone = mountpoint.clone();
-    /*ctrlc::set_handler(move || {
-        info!("Ricevuto segnale stop. Unmounting...");
-        let _ = Command::new("fusermount").arg("-u").arg(&mp_clone).status();
-        std::process::exit(0);
-    }).expect("Errore handler Ctrl-C");*/
-
+    // inizializzo il file system, passando i parametri di configurazione per la cache
     let fs = RemoteFS::new(!args.no_cache, args.cache_capacity, args.ttl);
 
+    // creo la cartella di mount se non esiste già
     if !std::path::Path::new(&mountpoint).exists() {
         std::fs::create_dir_all(&mountpoint).unwrap();
     }
@@ -896,6 +1072,7 @@ fn main() {
         mountpoint, !args.no_cache, args.ttl
     );
 
+    // mount del file system, con le opzioni per il nome del file system, auto unmount e allow other
     if let Err(e) = fuser::mount2(
         fs,
         &mountpoint,
