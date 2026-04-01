@@ -28,21 +28,23 @@ pub struct OpenedFile {
     pub flags: OpenFlags,
 }
 
-// Rimuoviamo derive Clone perché NamedTempFile non è clonabile facilmente.
-// Gestiremo la struttura tramite riferimenti o Arc/Mutex se necessario, 
-// ma per FUSE single-threaded (default) va bene così.
+
 #[derive(Debug)] 
 pub struct RfsFile {
     pub file_entry: FileEntry,
     pub file_path: PathBuf,
+    // mappa di tutti i fd aperti su questo file, con i relativi flag e inode
     pub fds: HashMap<Fd, OpenedFile>,
     
-    // MODIFICA: Buffer su disco per supportare file >100MB
+    // buffer su disco per supportare file >100MB
     pub write_buffer: Option<NamedTempFile>, 
     pub is_dirty: bool,
 
     pub read_buffer: Vec<u8>,
     pub read_buffer_offset: u64,
+
+    // per soft delete: se un file è stato cancellato ma è ancora aperto da qualche altra parte,
+    // lo teniamo in memoria finché non viene chiuso
     pub unlinked: bool,
 }
 
