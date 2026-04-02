@@ -88,6 +88,7 @@ pub async fn write_file_contents(req: HttpRequest, path: SafePath, mut payload: 
 
     while let Some(chunk) = payload.next().await {
         let bytes = chunk.map_err(|e| ErrorBadRequest(e))?;
+        //info!("SERVER WRITE: Scrivendo chunk di {} bytes su '{:?}'", bytes.len(), full_path);
         file.write_all(&bytes).await.map_err(|e| ErrorInternalServerError(e))?;
     }
 

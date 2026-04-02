@@ -17,6 +17,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 use log:: {debug};
+use std::process::Command;
+use std::process::exit;
 
 mod api;
 mod cache;
@@ -1063,6 +1065,22 @@ fn main() {
 
     let args = Args::parse();
     let mountpoint = args.mount_point.clone();
+
+    // gestione graceful shutdown 
+    let mp_handler = mountpoint.clone();
+    ctrlc::set_handler(move || {
+        info!("Segnale di interruzione ricevuto. Smontaggio in corso...");
+        
+        // Tentativo di smontaggio "pigro" (lazy)
+        let _ = Command::new("umount")
+            .arg("-l")
+            .arg(&mp_handler)
+            .status();
+
+        info!("Smontaggio richiesto al kernel. Uscita forzata del processo.");
+        // Senza questo exit(0), il loop di fuser potrebbe restare appeso
+        exit(0);
+    }).expect("Errore nell'impostazione del gestore segnali");
 
     if args.daemon {
         // salvo i log
