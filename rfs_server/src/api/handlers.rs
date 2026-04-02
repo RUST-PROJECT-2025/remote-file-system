@@ -7,11 +7,13 @@ use futures_util::stream::{StreamExt, TryStreamExt};
 use std::io::SeekFrom;
 use crate::api::{helpers::parse_range, models::SafePath};
 
-// LIST
+/// LIST
 pub async fn list_directory(safe_path: SafePath) -> Result<HttpResponse, actix_web::Error> {
     let full_path = safe_path.into_inner();
+    // se il path non esiste, ritorno 404
     if !full_path.exists() { return Ok(HttpResponse::NotFound().finish()); }
     
+    // se il path esiste ma non è una directory, ritorno 400
     if !fs::metadata(&full_path).await?.is_dir() {
         return Err(ErrorBadRequest("Non è una directory"));
     }
@@ -29,7 +31,7 @@ pub async fn list_directory(safe_path: SafePath) -> Result<HttpResponse, actix_w
     Ok(HttpResponse::Ok().json(entries))
 }
 
-// READ
+/// READ
 pub async fn read_file_contents(req: HttpRequest, path: SafePath) -> Result<HttpResponse, actix_web::Error> {
     let full_path = path.into_inner();
     if !full_path.exists() { return Ok(HttpResponse::NotFound().finish()); }
@@ -42,6 +44,7 @@ pub async fn read_file_contents(req: HttpRequest, path: SafePath) -> Result<Http
     let mut file = fs::File::open(&full_path).await?;
     file.seek(SeekFrom::Start(start)).await?;
 
+    // lettura del file in streaming con FramedRead 
     let stream = FramedRead::new(file.take(length), BytesCodec::new())
         .map_ok(|bytes| web::Bytes::from(bytes.freeze()))
         .map_err(|e| ErrorInternalServerError(e));
@@ -52,7 +55,8 @@ pub async fn read_file_contents(req: HttpRequest, path: SafePath) -> Result<Http
         .streaming(stream))
 }
 
-// WRITE (PUT)
+/// WRITE (PUT)
+/// scrittura di un file, con supporto a payload in streaming per file di grandi dimensioni
 pub async fn write_file_contents(path: SafePath, mut payload: web::Payload) -> Result<HttpResponse, actix_web::Error> {
     let full_path = path.into_inner();
     let mut file = fs::File::create(&full_path).await.map_err(|e| ErrorInternalServerError(e))?;
@@ -64,21 +68,20 @@ pub async fn write_file_contents(path: SafePath, mut payload: web::Payload) -> R
     Ok(HttpResponse::Created().finish())
 }
 
-// MKDIR (POST)
+/// MKDIR (POST)
 pub async fn create_directory(path: SafePath) -> Result<HttpResponse, actix_web::Error> {
     let full_path = path.into_inner();
     fs::create_dir_all(&full_path).await.map_err(|e| ErrorInternalServerError(e))?;
     Ok(HttpResponse::Created().finish())
 }
 
-// DELETE
+/// DELETE
 pub async fn delete_file_or_directory(path: SafePath) -> Result<HttpResponse, actix_web::Error> {
     let full_path = path.into_inner();
     if !full_path.exists() { return Ok(HttpResponse::NotFound().finish()); }
 
-    // MODIFICA: Usiamo remove_dir invece di remove_dir_all per le directory.
-    // Questo farà fallire la richiesta se la directory contiene file, come richiesto da rmdir.
     if fs::metadata(&full_path).await?.is_dir() {
+        // la directory deve essere vuota per essere rimossa, altrimenti ritorna un errore
         fs::remove_dir(full_path).await
     } else {
         fs::remove_file(full_path).await
@@ -87,7 +90,7 @@ pub async fn delete_file_or_directory(path: SafePath) -> Result<HttpResponse, ac
     Ok(HttpResponse::Ok().finish())
 }
 
-// RENAME (PATCH)
+/// RENAME (PATCH)
 #[derive(Deserialize)]
 pub struct RenameRequest { new_name: String }
 
