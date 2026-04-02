@@ -2,10 +2,12 @@ use actix_web::{HttpRequest, HttpResponse, error::{ErrorBadRequest, ErrorInterna
 use serde::Deserialize;
 use shared::file_entry::FileEntry;
 use tokio::{fs, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}};
+use tokio::fs::OpenOptions;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use futures_util::stream::{StreamExt, TryStreamExt};
 use std::io::SeekFrom;
 use crate::api::{helpers::parse_range, models::SafePath};
+use log::info;
 
 /// LIST
 pub async fn list_directory(safe_path: SafePath) -> Result<HttpResponse, actix_web::Error> {
@@ -57,14 +59,38 @@ pub async fn read_file_contents(req: HttpRequest, path: SafePath) -> Result<Http
 
 /// WRITE (PUT)
 /// scrittura di un file, con supporto a payload in streaming per file di grandi dimensioni
-pub async fn write_file_contents(path: SafePath, mut payload: web::Payload) -> Result<HttpResponse, actix_web::Error> {
+pub async fn write_file_contents(req: HttpRequest, path: SafePath, mut payload: web::Payload) -> Result<HttpResponse, actix_web::Error> {
     let full_path = path.into_inner();
-    let mut file = fs::File::create(&full_path).await.map_err(|e| ErrorInternalServerError(e))?;
+
+    // leggo l'offset inviato dal client (se non c'è, default 0)
+    let offset: u64 = req.headers().get("x-write-offset")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+
+    info!("SERVER WRITE: Ricevuta richiesta PUT per '{:?}' con offset: {}", full_path, offset);
+    
+    // se il file esiste già, lo apro in modalità append e mi posiziono all'offset specificato
+    let mut options = OpenOptions::new();
+    options.write(true).create(true);
+
+    // se l'offset è 0, sovrascrittura totale, quindi tronchiamo
+    if offset == 0 {
+        options.truncate(true);
+    } 
+
+    // se l'offset è > 0, appendo al file esistente, ma mi posiziono all'offset specificato
+    let mut file = options.open(&full_path).await.map_err(|e| ErrorInternalServerError(e))?;
+
+    // posizionamento all'offset specificato
+    file.seek(SeekFrom::Start(offset)).await.map_err(|e| ErrorInternalServerError(e))?;
 
     while let Some(chunk) = payload.next().await {
         let bytes = chunk.map_err(|e| ErrorBadRequest(e))?;
         file.write_all(&bytes).await.map_err(|e| ErrorInternalServerError(e))?;
     }
+
     Ok(HttpResponse::Created().finish())
 }
 

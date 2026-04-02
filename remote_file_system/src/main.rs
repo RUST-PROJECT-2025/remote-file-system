@@ -414,7 +414,7 @@ impl Filesystem for RemoteFS {
         info!("FUSE MKNOD: Creazione nuovo file vuoto '{}'", new_path .to_string_lossy().to_string());
 
         // fa la PUT con body vuoto
-        if let Err(e) = self.cache.api.write_file(&new_path.to_string_lossy(), std::io::empty()) {
+        if let Err(e) = self.cache.api.write_file(&new_path.to_string_lossy(), std::io::empty(), 0) {
             error!("FUSE MKNOD: Fallimento API durante la creazione di '{}': {}", new_path.to_string_lossy(), e);
             reply.error(EIO);
             return;
@@ -469,7 +469,7 @@ impl Filesystem for RemoteFS {
         info!("FUSE CREATE: Creazione e apertura simultanea di '{}'", new_path.to_string_lossy().to_string());
 
         // crea il file vuoto 
-        if let Err(e) = self.cache.api.write_file(&new_path.to_string_lossy(), std::io::empty()) {
+        if let Err(e) = self.cache.api.write_file(&new_path.to_string_lossy(), std::io::empty(), 0) {
             error!("FUSE CREATE: Fallimento API per '{}': {}", new_path.to_string_lossy().to_string(), e);
             reply.error(EIO);
             return;
@@ -894,6 +894,12 @@ impl Filesystem for RemoteFS {
             // riferimento mutabile al file temporaneo 
             let file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
 
+            if let Some(current_min) = rfs_file.dirty_offset {
+                rfs_file.dirty_offset = Some(std::cmp::min(current_min, offset as u64));
+            } else {
+                rfs_file.dirty_offset = Some(offset as u64);
+            }
+
             // posiziono il cursore del file temporaneo alla posizione richiesta per la scrittura
             if file.seek(SeekFrom::Start(offset as u64)).is_err() {
                 reply.error(EIO);
@@ -930,13 +936,24 @@ impl Filesystem for RemoteFS {
                 let temp_file = rfs_file.write_buffer.as_mut().unwrap();
                 let path = rfs_file.file_path.to_string_lossy().to_string();
 
+                // recuperiamo l'offset minimo modificato (default 0 se non impostato)
+                let min_offset = rfs_file.dirty_offset.unwrap_or(0);
+
                 // per fare il flush, riapro il file temporaneo in modalità lettura e 
                 // passo quel reader all'API di scrittura del server,
                 // in modo da inviare i dati modificati al server
-                if let Ok(reader) = temp_file.reopen() {
+                if let Ok(mut reader) = temp_file.reopen() {
+
+                    // spostiamo il cursore per saltare i byte nulli iniziali
+                    if let Err(e) = reader.seek(SeekFrom::Start(min_offset)) {
+                        error!("FUSE FLUSH: Fallimento seek sul file locale per '{}': {}", path, e);
+                        reply.error(libc::EIO);
+                        return;
+                    }
+
                     info!("FUSE FLUSH: Avvio streaming upload al server per '{}'", path);
                     // scrivo sul server
-                    if self.cache.api.write_file(&path, reader).is_err() {
+                    if self.cache.api.write_file(&path, reader, min_offset).is_err() {
                         error!("FUSE FLUSH: Fallimento upload API per '{}'", path);
                         reply.error(EIO);
                         return;
@@ -961,6 +978,7 @@ impl Filesystem for RemoteFS {
                     
                     // resetto il flag
                     rfs_file.is_dirty = false;
+                    rfs_file.dirty_offset = None;
                 } else {
                     error!("FUSE FLUSH: Fallimento reopen del file temporaneo locale per Inode {}", ino);
                     reply.error(EIO);

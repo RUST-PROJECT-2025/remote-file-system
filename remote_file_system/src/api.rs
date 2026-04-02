@@ -81,16 +81,17 @@ impl Api {
     }
 
     /// scrive i dati in un file specificato da path, restituendo un errore se il file non esiste o c'è un problema di rete
-    pub fn write_file<R: Read + Send + 'static>(&self, path: &str, data: R) -> Result<(), Error> {
+    pub fn write_file<R: Read + Send + 'static>(&self, path: &str, data: R, offset: u64) -> Result<(), Error> {
         let url = format!("{}files{}", self.base_url, path);
 
-        debug!("API PUT write_file richiesta streaming per: {}", path);
+        debug!("API PUT write_file richiesta streaming per: {} (Offset: {})", path, offset);
 
         // Reqwest blocking supporta il passaggio diretto di un Reader nel Body
         // un Reader è un oggetto che implementa la lettura di dati, e può essere usato per inviare dati di grandi dimensioni senza doverli caricare tutti in ram.
         let resp = self
             .client
             .put(&url)
+            .header("x-write-offset", offset.to_string())
             .body(reqwest::blocking::Body::new(data))
             .send()
             .map_err(|e| {
