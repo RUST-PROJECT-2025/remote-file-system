@@ -1,28 +1,5 @@
 # remote-file-system
 
-# To start container
-
-```shell
-cd nome_cartella_progetto
-
-# per buildare l'immagine
-docker build -t rust-fuse-dev .
-
-# dare i permessi ed eseguire lo script 
-chmod +x run.sh
-./run.sh
-````
-
-``` shell
-# Entra nel container
-docker exec -it rfs-client bash
-
-# Spostati nel mount point
-cd /mnt/remote-fs
-```
-
-
-
 # Guida all'avvio rapido
 Segui questi passaggi per avviare l'intera infrastruttura (Client, Server e Rete virtuale) in un ambiente Linux isolato tramite Docker.
 
