@@ -2,7 +2,9 @@ use actix_web::{FromRequest, HttpRequest, dev::Payload, error::{ErrorBadRequest,
 use futures_util::future::{LocalBoxFuture, ready, FutureExt};
 use std::path::PathBuf;
 
-const ROOT_DIR: &str = "/tmp/rfs_storage";
+fn root_dir() -> PathBuf {
+    std::env::temp_dir().join("rfs_storage")
+}
 
 // Wrapper per garantire che i path siano sempre sotto ROOT_DIR e prevenire path traversal
 // viene eseguito automaticamente da actix quando si usa SafePath come extractor nei handler
@@ -21,7 +23,7 @@ impl FromRequest for SafePath {
         let path_result: Result<web::Path<PathBuf>, actix_web::Error> =
             web::Path::from_request(req, payload).into_inner();
 
-        let root_path = PathBuf::from(ROOT_DIR);
+        let root_path = root_dir();
 
         match path_result {
             Ok(path) => {

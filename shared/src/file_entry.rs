@@ -21,7 +21,10 @@ impl FileEntry {
             is_dir: metadata.is_dir(),
             size: metadata.len(),
             modified_at: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            permissions: metadata.mode(), // Metodo di estensione di Unix
+            #[cfg(unix)]
+            permissions: metadata.mode(),
+            #[cfg(not(unix))]
+            permissions: 0, // Best-effort: no permissions on non-Unix
         }
     }
 }

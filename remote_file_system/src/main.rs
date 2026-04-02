@@ -1,10 +1,17 @@
 use clap::Parser;
+
+#[cfg(unix)]
 use daemonize::Daemonize;
+
+#[cfg(unix)]
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
+
+#[cfg(unix)]
 use libc::{EBADF, EIO, ENOENT, ENOTEMPTY};
+
 use log::{error, info};
 use shared::file_entry::FileEntry;
 use std::{
@@ -62,7 +69,9 @@ struct Args {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fd(pub u64);
 
+#[cfg(unix)]
 struct FileAttrWrapper(FileAttr);
+#[cfg(unix)]
 impl From<FileEntry> for FileAttrWrapper {
     fn from(val: FileEntry) -> Self {
         Self(FileAttr {
@@ -146,6 +155,7 @@ impl RemoteFS {
     }
 }
 
+#[cfg(unix)]
 impl Filesystem for RemoteFS {
     // METADATA
 
@@ -1062,13 +1072,17 @@ fn main() {
 
 
     let args = Args::parse();
+
+    #[cfg(unix)]
     let mountpoint = args.mount_point.clone();
 
+    #[cfg(unix)]
     if args.daemon {
         // salvo i log
-        let log_file = std::fs::File::create("/tmp/rfs.log").unwrap();
+        let temp_dir = std::env::temp_dir();
+        let log_file = std::fs::File::create(temp_dir.join("rfs.log")).unwrap();
         match Daemonize::new()
-            .pid_file("/tmp/rfs.pid")
+            .pid_file(temp_dir.join("rfs.pid"))
             .stdout(log_file.try_clone().unwrap())
             .stderr(log_file)
             .start()
@@ -1081,30 +1095,40 @@ fn main() {
         }
     }
 
-    // inizializzo il file system, passando i parametri di configurazione per la cache
-    let fs = RemoteFS::new(!args.no_cache, args.cache_capacity, args.ttl, args.server_url.clone());
+    #[cfg(unix)]
+    {
+        // inizializzo il file system, passando i parametri di configurazione per la cache
+        let fs = RemoteFS::new(!args.no_cache, args.cache_capacity, args.ttl, args.server_url.clone());
 
-    // creo la cartella di mount se non esiste già
-    if !std::path::Path::new(&mountpoint).exists() {
-        std::fs::create_dir_all(&mountpoint).unwrap();
+        // creo la cartella di mount se non esiste già
+        if !std::path::Path::new(&mountpoint).exists() {
+            std::fs::create_dir_all(&mountpoint).unwrap();
+        }
+
+        info!(
+            "Mounting at {} (Cache: {}, TTL: {}s)",
+            mountpoint, !args.no_cache, args.ttl
+        );
+
+        // mount del file system, con le opzioni per il nome del file system, auto unmount e allow other
+        if let Err(e) = fuser::mount2(
+            fs,
+            &mountpoint,
+            &[
+                MountOption::FSName("remote_fs".to_string()),
+                MountOption::AutoUnmount,
+                MountOption::AllowOther,
+            ],
+        ) {
+            error!("Errore mount: {}", e);
+        }
+        info!("File system smontato in modo pulito. Terminazione del demone.");
     }
 
-    info!(
-        "Mounting at {} (Cache: {}, TTL: {}s)",
-        mountpoint, !args.no_cache, args.ttl
-    );
-
-    // mount del file system, con le opzioni per il nome del file system, auto unmount e allow other
-    if let Err(e) = fuser::mount2(
-        fs,
-        &mountpoint,
-        &[
-            MountOption::FSName("remote_fs".to_string()),
-            MountOption::AutoUnmount,
-            MountOption::AllowOther,
-        ],
-    ) {
-        error!("Errore mount: {}", e);
+    #[cfg(not(unix))]
+    {
+        println!("FUSE-based mounting is not supported on this platform (Windows).");
+        println!("However, the remote file system server can be run separately and accessed via HTTP API.");
+        println!("Server URL: {}", args.server_url);
     }
-    info!("File system smontato in modo pulito. Terminazione del demone.");
 }

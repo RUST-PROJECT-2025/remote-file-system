@@ -10,9 +10,10 @@ async fn main() -> io::Result<()> {
     env_logger::init();
 
     // Crea la cartella di storage se non esiste
-    let storage_path = "/tmp/rfs_storage";
-    std::fs::create_dir_all(storage_path)?;
-    println!("Server avviato. Storage root: {}", storage_path);
+    let storage_path = std::env::temp_dir().join("rfs_storage");
+    let storage_path_str = storage_path.to_string_lossy().to_string();
+    std::fs::create_dir_all(&storage_path)?;
+    println!("Server avviato. Storage root: {}", storage_path_str);
     println!("Server avviato su 0.0.0.0:8080");
     //println!("In ascolto su http://127.0.0.1:8080");
 
