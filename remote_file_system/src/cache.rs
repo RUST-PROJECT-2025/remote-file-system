@@ -25,7 +25,7 @@ pub struct Cache {
 }
 
 impl Cache {
-    pub fn new(capacity: usize, ttl: Duration) -> Self {
+    pub fn new(capacity: usize, ttl: Duration, server_url: String) -> Self {
         let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
         
         info!("Inizializzazione Cache: LRU capacity = {}, TTL = {:?}", cap.get(), ttl);
@@ -34,7 +34,7 @@ impl Cache {
             files: LruCache::new(cap), 
             dir_cache: HashMap::new(),
             ttl,
-            api: Api::new() 
+            api: Api::new(server_url), 
         }
     }
 

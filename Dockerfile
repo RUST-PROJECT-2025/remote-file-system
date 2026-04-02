@@ -11,6 +11,7 @@ RUN apt update && \
         build-essential \
         fuse3 \
         libfuse3-dev \
+        libssl-dev \
         git \
         vim \
         ca-certificates \

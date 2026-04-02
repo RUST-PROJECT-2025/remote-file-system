@@ -53,6 +53,10 @@ struct Args {
     /// daemon mode
     #[arg(long)]
     daemon: bool,
+
+    /// URL del server remoto
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    server_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,8 +100,8 @@ struct RemoteFS {
 }
 
 impl RemoteFS {
-    fn new(use_cache: bool, cache_capacity: usize, ttl_secs: u64) -> Self {
-        let mut cache = Cache::new(cache_capacity, Duration::from_secs(ttl_secs));
+    fn new(use_cache: bool, cache_capacity: usize, ttl_secs: u64, server_url: String) -> Self {
+        let mut cache = Cache::new(cache_capacity, Duration::from_secs(ttl_secs), server_url.clone());
 
         // Inizializziamo manualmente la Root (Inode 1)
         cache.files.put(
@@ -1078,7 +1082,7 @@ fn main() {
     }
 
     // inizializzo il file system, passando i parametri di configurazione per la cache
-    let fs = RemoteFS::new(!args.no_cache, args.cache_capacity, args.ttl);
+    let fs = RemoteFS::new(!args.no_cache, args.cache_capacity, args.ttl, args.server_url.clone());
 
     // creo la cartella di mount se non esiste già
     if !std::path::Path::new(&mountpoint).exists() {

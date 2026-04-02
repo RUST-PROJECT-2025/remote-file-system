@@ -11,11 +11,19 @@ pub struct Api {
 
 impl Api {
     /// inizializza il client HTTP
-    pub fn new() -> Self {
+    pub fn new(server_url: String) -> Self {
         info!("Inizializzazione Client API REST");
+        // Puliamo l'URL per assicurarci che finisca con /api/
+        let base_url = if server_url.ends_with('/') {
+            format!("{}api/", server_url)
+        } else {
+            format!("{}/api/", server_url)
+        };
+
+        info!("Inizializzazione Client API REST verso: {}", base_url);
         Self {
             client: Client::new(),
-            base_url: "http://127.0.0.1:8080/api/".to_string(),
+            base_url: base_url,
         }
     }
 
