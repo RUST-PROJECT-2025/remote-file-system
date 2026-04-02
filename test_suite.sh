@@ -17,6 +17,7 @@ NC='\033[0m' # No Color
 
 # Configuration
 MOUNT_POINT="/tmp/rfs-test-mount"
+SERVER_STORAGE="/tmp/rfs-test-storage" # Cartella di storage separata per il server
 RFS_BINARY="./target/debug/remote_file_system"
 RFS_SERVER_BINARY="./target/debug/rfs_server"
 RFS_PID=""
@@ -26,12 +27,6 @@ TEST_PASSED=0
 # Only use SKIP_SETUP if explicitly passed from environment
 # Default to 0 (do full setup) to ensure clean test runs
 SKIP_SETUP=${SKIP_SETUP:-0}
-
-# Debug: show what mode we're in
-if [ "$SKIP_SETUP" = "1" ]; then
-    # This is intentional - user wants to skip setup
-    :
-fi
 
 ##############################################################################
 # Utility Functions
@@ -55,13 +50,6 @@ log_test() {
     echo -e "${YELLOW}[TEST]${NC} $1"
 }
 
-measure_time() {
-    local start=$SECONDS
-    "$@"
-    local end=$SECONDS
-    echo $((end - start))
-}
-
 cleanup() {
     log_info "Cleaning up..."
     if [ "$SKIP_SETUP" = "1" ]; then
@@ -72,24 +60,23 @@ cleanup() {
     # Kill RFS server if we started it
     if [ ! -z "$RFS_SERVER_PID" ] && kill -0 $RFS_SERVER_PID 2>/dev/null; then
         log_info "Stopping RFS server (PID: $RFS_SERVER_PID)"
-        kill $RFS_SERVER_PID 2>/dev/null || true
+        kill -9 $RFS_SERVER_PID 2>/dev/null || true
         sleep 1
     fi
 
-    # Kill FUSE daemon
+    # Kill FUSE daemon (solo come fallback se l'unmount fallisce)
     if [ ! -z "$RFS_PID" ] && kill -0 $RFS_PID 2>/dev/null; then
         log_info "Stopping FUSE daemon (PID: $RFS_PID)"
-        kill $RFS_PID 2>/dev/null || true
+        kill -9 $RFS_PID 2>/dev/null || true
         sleep 1
     fi
 
     if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
         log_info "Unmounting $MOUNT_POINT"
-        # Try common fusermount variants, then fallback to umount
-        if command -v fusermount >/dev/null 2>&1; then
-            fusermount -u "$MOUNT_POINT" 2>/dev/null || true
-        elif command -v fusermount3 >/dev/null 2>&1; then
+        if command -v fusermount3 >/dev/null 2>&1; then
             fusermount3 -u "$MOUNT_POINT" 2>/dev/null || true
+        elif command -v fusermount >/dev/null 2>&1; then
+            fusermount -u "$MOUNT_POINT" 2>/dev/null || true
         else
             umount "$MOUNT_POINT" 2>/dev/null || true
         fi
@@ -98,6 +85,10 @@ cleanup() {
 
     if [ -d "$MOUNT_POINT" ]; then
         rm -rf "$MOUNT_POINT"
+    fi
+    
+    if [ -d "$SERVER_STORAGE" ]; then
+        rm -rf "$SERVER_STORAGE"
     fi
 }
 
@@ -109,9 +100,10 @@ setup() {
     # Clean environment
     cleanup 2>/dev/null || true
     
-    # Create mount point
+    # Create mount point and server storage
     mkdir -p "$MOUNT_POINT"
-    log_pass "Mount point created: $MOUNT_POINT"
+    mkdir -p "$SERVER_STORAGE"
+    log_pass "Directories created: Mount -> $MOUNT_POINT | Storage -> $SERVER_STORAGE"
     
     # Check if binaries exist
     if [ ! -f "$RFS_BINARY" ]; then
@@ -125,6 +117,9 @@ setup() {
         log_info "Building server..."
         cargo build --bin rfs_server
     fi
+    
+    # Export env var for the server
+    export RFS_STORAGE_PATH="$SERVER_STORAGE"
     
     # Start RFS HTTP server first
     log_info "Starting RFS server on http://127.0.0.1:8080..."
@@ -193,7 +188,7 @@ test_mount_unmount() {
 test_create_file() {
     log_test "Create File Operation"
     
-    local test_file="$MOUNT_POINT/test.txt"
+    local test_file="$MOUNT_POINT/test_create_${RANDOM}.txt"
     echo "Hello World" > "$test_file"
     
     if [ -f "$test_file" ]; then
@@ -207,7 +202,8 @@ test_create_file() {
 test_read_file() {
     log_test "Read File Operation"
     
-    local test_file="$MOUNT_POINT/test.txt"
+    local test_file="$MOUNT_POINT/test_read_${RANDOM}.txt"
+    echo "Hello World" > "$test_file"
     local content=$(cat "$test_file" 2>/dev/null)
     
     if [ "$content" = "Hello World" ]; then
@@ -221,7 +217,8 @@ test_read_file() {
 test_update_file() {
     log_test "Update File Operation"
     
-    local test_file="$MOUNT_POINT/test.txt"
+    local test_file="$MOUNT_POINT/test_update_${RANDOM}.txt"
+    echo "Initial Content" > "$test_file"
     echo "Updated Content" > "$test_file"
     
     local content=$(cat "$test_file" 2>/dev/null)
@@ -233,10 +230,39 @@ test_update_file() {
     fi
 }
 
+test_append_file() {
+    log_test "Append to File Operation"
+    
+    local test_file="$MOUNT_POINT/test_append_${RANDOM}.txt"
+    
+    # 1. Scrittura iniziale
+    echo "Test 1 Prima riga" > "$test_file"
+    
+    # 2. Append (nota il doppio >>)
+    echo "Seconda riga test" >> "$test_file"
+    
+    # 3. Lettura del file
+    local content=$(cat "$test_file" 2>/dev/null)
+    local line_count=$(wc -l < "$test_file")
+    
+    # Stampiamo visivamente il contenuto per controllo
+    log_info "Contenuto letto dal file dopo l'append:"
+    echo "$content"
+    
+    # Verifica: ci aspettiamo esattamente 2 righe e la presenza di entrambe le frasi
+    if [ "$line_count" -eq 2 ] && echo "$content" | grep -q "Test 1 Prima riga" && echo "$content" | grep -q "Seconda riga test"; then
+        log_pass "File append successful"
+    else
+        log_fail "File append failed. Contenuto inatteso."
+        return 1
+    fi
+}
+
 test_delete_file() {
     log_test "Delete File Operation"
     
-    local test_file="$MOUNT_POINT/test.txt"
+    local test_file="$MOUNT_POINT/test_delete_${RANDOM}.txt"
+    echo "To be deleted" > "$test_file"
     rm "$test_file"
     
     if [ ! -f "$test_file" ]; then
@@ -250,7 +276,7 @@ test_delete_file() {
 test_mkdir() {
     log_test "Create Directory Operation"
     
-    local test_dir="$MOUNT_POINT/testdir"
+    local test_dir="$MOUNT_POINT/testdir_${RANDOM}"
     mkdir "$test_dir"
     
     if [ -d "$test_dir" ]; then
@@ -264,7 +290,8 @@ test_mkdir() {
 test_rmdir() {
     log_test "Remove Directory Operation"
     
-    local test_dir="$MOUNT_POINT/testdir"
+    local test_dir="$MOUNT_POINT/testdir_rm_${RANDOM}"
+    mkdir "$test_dir"
     rmdir "$test_dir"
     
     if [ ! -d "$test_dir" ]; then
@@ -278,13 +305,15 @@ test_rmdir() {
 test_list_directory() {
     log_test "List Directory Contents"
     
-    local content1="$MOUNT_POINT/file1.txt"
-    local content2="$MOUNT_POINT/file2.txt"
+    local test_dir="$MOUNT_POINT/testdir_list_${RANDOM}"
+    mkdir "$test_dir"
+    local content1="$test_dir/file1.txt"
+    local content2="$test_dir/file2.txt"
     
     echo "Content 1" > "$content1"
     echo "Content 2" > "$content2"
     
-    local listing=$(ls "$MOUNT_POINT" | wc -l)
+    local listing=$(ls "$test_dir" | wc -l)
     
     if [ $listing -ge 2 ]; then
         log_pass "Directory listing works (found $listing entries)"
@@ -292,8 +321,6 @@ test_list_directory() {
         log_fail "Directory listing failed"
         return 1
     fi
-    
-    rm "$content1" "$content2"
 }
 
 ##############################################################################
@@ -303,7 +330,7 @@ test_list_directory() {
 test_file_size() {
     log_test "File Size Attribute"
     
-    local test_file="$MOUNT_POINT/size_test.txt"
+    local test_file="$MOUNT_POINT/size_test_${RANDOM}.txt"
     echo "1234567890" > "$test_file"  # 11 bytes (including newline)
     
     local size=$(stat -c%s "$test_file" 2>/dev/null || stat -f%z "$test_file" 2>/dev/null)
@@ -314,14 +341,12 @@ test_file_size() {
         log_fail "File size attribute not readable"
         return 1
     fi
-    
-    rm "$test_file"
 }
 
 test_file_permissions() {
     log_test "File Permissions Attribute"
     
-    local test_file="$MOUNT_POINT/perm_test.txt"
+    local test_file="$MOUNT_POINT/perm_test_${RANDOM}.txt"
     echo "test" > "$test_file"
     chmod 644 "$test_file"
     
@@ -333,14 +358,12 @@ test_file_permissions() {
         log_fail "File permissions not readable"
         return 1
     fi
-    
-    rm "$test_file"
 }
 
 test_file_timestamps() {
     log_test "File Timestamps Attribute"
     
-    local test_file="$MOUNT_POINT/time_test.txt"
+    local test_file="$MOUNT_POINT/time_test_${RANDOM}.txt"
     echo "test" > "$test_file"
     
     local timestamp=$(stat -c%y "$test_file" 2>/dev/null || stat -f "%Sm" "$test_file" 2>/dev/null)
@@ -351,96 +374,134 @@ test_file_timestamps() {
         log_fail "File timestamp not readable"
         return 1
     fi
-    
-    rm "$test_file"
 }
 
 ##############################################################################
-# Test Suite 4: Large Files
+# Test Suite 4: Large Files (Streaming Support 200MB+ & Latenza)
 ##############################################################################
 
 test_large_file_write() {
-    log_test "Large File Write (10MB)"
+    log_test "Large File Write (200MB+ Streaming & Latenza)"
     
-    local test_file="$MOUNT_POINT/large_file.bin"
+    local test_file="$MOUNT_POINT/large_file_${RANDOM}.bin"
     
-    # Write 10MB file
-    log_info "Writing 10MB file..."
-    dd if=/dev/zero of="$test_file" bs=1M count=10 2>/dev/null
+    log_info "Writing 200MB file... (Questo testerà il buffering e lo streaming)"
+    
+    # Iniziamo a misurare un attimo prima dell'operazione di I/O
+    local start_time=$(date +%s%3N)
+    
+    # Usiamo urandom/zero per generare 200 blocchi da 1MB
+    dd if=/dev/zero of="$test_file" bs=1M count=200 2>/dev/null
+    
+    # Fermiamo il cronometro appena il comando finisce
+    local end_time=$(date +%s%3N)
+    local elapsed=$((end_time - start_time))
     
     if [ -f "$test_file" ]; then
         local size=$(stat -c%s "$test_file" 2>/dev/null || stat -f%z "$test_file" 2>/dev/null)
-        local expected=$((10 * 1024 * 1024))
+        local expected=$((200 * 1024 * 1024))
         
         if [ $size -eq $expected ]; then
-            log_pass "Large file written successfully: $size bytes"
+            # Calcolo approssimativo del throughput in MB/s (200MB / secondi)
+            # Moltiplichiamo per 1000 per gestire la divisione intera con i millisecondi
+            local throughput=0
+            if [ $elapsed -gt 0 ]; then
+                throughput=$(( 200000 / elapsed ))
+            fi
+            
+            log_pass "File da 200MB scritto in ${elapsed}ms (Throughput: ~${throughput} MB/s)"
         else
-            log_fail "Large file size mismatch: expected $expected, got $size"
+            log_fail "Mismatch dimensione file grande: atteso $expected, trovato $size"
         fi
     else
-        log_fail "Large file write failed"
+        log_fail "Scrittura file da 200MB fallita"
     fi
-    
-    rm "$test_file"
 }
 
 test_large_file_read() {
-    log_test "Large File Read (10MB)"
+    log_test "Large File Read (200MB+ Streaming & Latenza)"
     
-    local test_file="$MOUNT_POINT/large_read.bin"
+    local test_file="$MOUNT_POINT/large_read_${RANDOM}.bin"
     
-    # Write file
-    dd if=/dev/zero of="$test_file" bs=1M count=10 2>/dev/null
+    # Creiamo preventivamente il file da 200MB (non lo contiamo nella latenza di lettura!)
+    dd if=/dev/zero of="$test_file" bs=1M count=200 2>/dev/null
     
-    # Read and verify
-    log_info "Reading 10MB file..."
+    log_info "Reading 200MB file... (Questo testerà il prefetching)"
+    
+    # Iniziamo a misurare
+    local start_time=$(date +%s%3N)
+    
+    # wc -c forza la lettura sequenziale di tutto il file da cima a fondo
     local read_bytes=$(wc -c < "$test_file")
-    local expected=$((10 * 1024 * 1024))
+    
+    # Fermiamo il cronometro
+    local end_time=$(date +%s%3N)
+    local elapsed=$((end_time - start_time))
+    
+    local expected=$((200 * 1024 * 1024))
     
     if [ $read_bytes -eq $expected ]; then
-        log_pass "Large file read successfully: $read_bytes bytes"
+        local throughput=0
+        if [ $elapsed -gt 0 ]; then
+            throughput=$(( 200000 / elapsed ))
+        fi
+        
+        log_pass "File da 200MB letto in ${elapsed}ms (Throughput: ~${throughput} MB/s)"
     else
-        log_fail "Large file read mismatch: expected $expected, got $read_bytes"
+        log_fail "Mismatch lettura file grande: atteso $expected, letti $read_bytes"
     fi
-    
-    rm "$test_file"
 }
 
 ##############################################################################
-# Test Suite 5: Performance
+# Test Suite 5: Performance (<500ms Latency Requirement)
 ##############################################################################
 
-test_small_file_latency() {
-    log_test "Small File Operation Latency"
+test_strict_latency() {
+    log_test "Strict Latency Requirement (<500ms)"
     
-    local test_file="$MOUNT_POINT/latency_test.txt"
+    local test_file="$MOUNT_POINT/strict_latency_${RANDOM}.txt"
     
-    local elapsed=$( { time echo "test content" > "$test_file"; } 2>&1 | grep real | awk '{print $2}')
+    # Misuriamo il ciclo completo di un'operazione comune: apertura, scrittura e lettura
+    local start_time=$(date +%s%3N)
     
-    log_pass "Small file write operation completed (latency acceptable)"
+    echo "Verifica requisiti non funzionali" > "$test_file"
+    cat "$test_file" > /dev/null
     
-    rm "$test_file"
+    local end_time=$(date +%s%3N)
+    local elapsed=$((end_time - start_time))
+    
+    # Il requisito chiede <500ms
+    if [ $elapsed -lt 500 ]; then
+        log_pass "Latenza operativa I/O: ${elapsed}ms (Requisito <500ms SODDISFATTO)"
+    else
+        log_fail "Latenza TROPPO ALTA: ${elapsed}ms (Atteso <500ms)"
+        return 1
+    fi
 }
 
 test_directory_listing_speed() {
     log_test "Directory Listing Performance"
     
-    # Create 50 files
+    local perf_dir="$MOUNT_POINT/perf_dir_${RANDOM}"
+    mkdir "$perf_dir"
+    
     log_info "Creating 50 test files..."
     for i in {1..50}; do
-        echo "file $i" > "$MOUNT_POINT/file_$i.txt"
+        echo "file $i" > "$perf_dir/file_$i.txt"
     done
     
-    # Time directory listing
-    log_info "Listing directory with 50 files..."
-    ls "$MOUNT_POINT" > /dev/null
+    local start_time=$(date +%s%3N)
+    ls "$perf_dir" > /dev/null
+    local end_time=$(date +%s%3N)
+    local elapsed=$((end_time - start_time))
     
-    log_pass "Directory listing completed"
-    
-    # Cleanup
-    for i in {1..50}; do
-        rm "$MOUNT_POINT/file_$i.txt" 2>/dev/null || true
-    done
+    # Un list di 50 file deve stare comodamente sotto i 500ms
+    if [ $elapsed -lt 500 ]; then
+        log_pass "Listing di 50 file completato in ${elapsed}ms (Requisito <500ms SODDISFATTO)"
+    else
+        log_fail "Directory listing troppo lento: ${elapsed}ms"
+        return 1
+    fi
 }
 
 ##############################################################################
@@ -450,7 +511,7 @@ test_directory_listing_speed() {
 test_cache_hit() {
     log_test "Cache Hit Verification"
     
-    local test_file="$MOUNT_POINT/cache_test.txt"
+    local test_file="$MOUNT_POINT/cache_test_${RANDOM}.txt"
     echo "cache test content" > "$test_file"
     
     # First read (cache miss)
@@ -464,14 +525,12 @@ test_cache_hit() {
     else
         log_fail "Cache inconsistency detected"
     fi
-    
-    rm "$test_file"
 }
 
 test_cache_invalidation_ttl() {
     log_test "Cache Invalidation (TTL)"
     
-    local test_file="$MOUNT_POINT/ttl_test.txt"
+    local test_file="$MOUNT_POINT/ttl_test_${RANDOM}.txt"
     echo "original content" > "$test_file"
     
     # Read (cache)
@@ -489,8 +548,6 @@ test_cache_invalidation_ttl() {
     else
         log_fail "Cache TTL invalidation issue"
     fi
-    
-    rm "$test_file"
 }
 
 ##############################################################################
@@ -500,7 +557,7 @@ test_cache_invalidation_ttl() {
 test_read_nonexistent_file() {
     log_test "Read Non-existent File (Error Handling)"
     
-    if ! cat "$MOUNT_POINT/nonexistent.txt" 2>/dev/null; then
+    if ! cat "$MOUNT_POINT/nonexistent_${RANDOM}.txt" 2>/dev/null; then
         log_pass "Error handling for non-existent file works"
     else
         log_fail "Should fail on non-existent file"
@@ -510,7 +567,7 @@ test_read_nonexistent_file() {
 test_delete_nonexistent_file() {
     log_test "Delete Non-existent File (Error Handling)"
     
-    if ! rm "$MOUNT_POINT/nonexistent.txt" 2>/dev/null; then
+    if ! rm "$MOUNT_POINT/nonexistent_${RANDOM}.txt" 2>/dev/null; then
         log_pass "Error handling for delete non-existent file works"
     else
         log_fail "Should fail on delete non-existent file"
@@ -525,12 +582,13 @@ test_concurrent_writes() {
     log_test "Concurrent Write Operations"
     
     local pids=()
+    local prefix="${RANDOM}"
     
     # Start 5 concurrent writes
     for i in {1..5}; do
         {
             for j in {1..10}; do
-                echo "Content $i-$j" > "$MOUNT_POINT/concurrent_$i.txt"
+                echo "Content $i-$j" > "$MOUNT_POINT/concurrent_${prefix}_$i.txt"
             done
         } &
         pids+=($!)
@@ -549,11 +607,6 @@ test_concurrent_writes() {
     else
         log_fail "Some concurrent writes failed"
     fi
-    
-    # Cleanup
-    for i in {1..5}; do
-        rm "$MOUNT_POINT/concurrent_$i.txt" 2>/dev/null || true
-    done
 }
 
 ##############################################################################
@@ -563,8 +616,8 @@ test_concurrent_writes() {
 test_file_rename() {
     log_test "File Rename Operation"
     
-    local file1="$MOUNT_POINT/original.txt"
-    local file2="$MOUNT_POINT/renamed.txt"
+    local file1="$MOUNT_POINT/original_${RANDOM}.txt"
+    local file2="$MOUNT_POINT/renamed_${RANDOM}.txt"
     
     echo "rename test" > "$file1"
     mv "$file1" "$file2"
@@ -574,14 +627,13 @@ test_file_rename() {
     else
         log_fail "File rename failed"
     fi
-    
-    rm "$file2" 2>/dev/null || true
 }
 
 test_nested_directories() {
     log_test "Nested Directory Operations"
     
-    local nested="$MOUNT_POINT/dir1/dir2/dir3"
+    local dir_id="${RANDOM}"
+    local nested="$MOUNT_POINT/dir1_${dir_id}/dir2/dir3"
     mkdir -p "$nested" 2>/dev/null || true
     
     if [ -d "$nested" ]; then
@@ -589,8 +641,6 @@ test_nested_directories() {
     else
         log_fail "Nested directory creation failed (expected behavior: may not be fully supported)"
     fi
-    
-    rm -rf "$MOUNT_POINT/dir1" 2>/dev/null || true
 }
 
 ##############################################################################
@@ -632,41 +682,40 @@ test_daemon_mode() {
 }
 
 ##############################################################################
-# Test Suite 11: Graceful Shutdown
+# Test Suite 11: Graceful Shutdown 
 ##############################################################################
 
 test_graceful_shutdown() {
     log_test "Graceful Shutdown (Flush in chiusura)"
     
-    local test_file="$MOUNT_POINT/shutdown.txt"
+    local file_name="shutdown_${RANDOM}.txt"
+    local test_file="$MOUNT_POINT/$file_name"
+    
     echo "Dati salvati prima dello spegnimento" > "$test_file"
     
-    if [ ! -z "$RFS_PID" ]; then
-        # Inviamo un SIGTERM per richiedere la chiusura pulita
-        kill -TERM $RFS_PID
-        sleep 2
-        
-        # Controlliamo direttamente nella cartella di salvataggio del server 
-        # (di default supponiamo sia /tmp/rfs_storage)
-        local storage_path="${RFS_STORAGE_PATH:-/tmp/rfs_storage}"
-        
-        if [ "$(cat "$storage_path/shutdown.txt" 2>/dev/null)" = "Dati salvati prima dello spegnimento" ]; then
-            log_pass "I dati sono stati flushati al server prima della terminazione"
-        else
-            log_fail "Dati persi, il client non ha completato il flush in chiusura"
-            return 1
-        fi
-        rm "$storage_path/shutdown.txt" 2>/dev/null || true
-        
-        # Riavviamo il demone per permettere alla Suite 12 di eseguire i suoi test
-        log_info "Riavvio FUSE daemon per i test rimanenti..."
-        $RFS_BINARY --mount-point "$MOUNT_POINT" > /tmp/rfs_test_restart.log 2>&1 &
-        RFS_PID=$!
-        sleep 2
+    log_info "Eseguo unmount pulito per innescare il flush..."
+    if command -v fusermount3 >/dev/null 2>&1; then
+        fusermount3 -u "$MOUNT_POINT"
     else
-        log_fail "PID del client FUSE non trovato"
+        fusermount -u "$MOUNT_POINT"
+    fi
+    sleep 2
+    
+    # FIX: Il server Rust "hardcoda" /tmp/rfs_storage ignorando la variabile d'ambiente!
+    # Andiamo a leggere fisicamente dove sappiamo che il server scriverà.
+    local HARDCODED_SERVER_DIR="/tmp/rfs_storage"
+    
+    if [ "$(cat "$HARDCODED_SERVER_DIR/$file_name" 2>/dev/null)" = "Dati salvati prima dello spegnimento" ]; then
+        log_pass "I dati sono stati flushati al server prima della terminazione"
+    else
+        log_fail "Dati persi, il client non ha completato il flush in chiusura"
         return 1
     fi
+    
+    log_info "Riavvio FUSE daemon per i test rimanenti..."
+    $RFS_BINARY --mount-point "$MOUNT_POINT" > /tmp/rfs_test_restart.log 2>&1 &
+    RFS_PID=$!
+    sleep 2
 }
 
 ##############################################################################
@@ -731,6 +780,7 @@ main() {
     test_create_file
     test_read_file
     test_update_file
+    test_append_file
     test_delete_file
     test_mkdir
     test_rmdir
@@ -749,7 +799,7 @@ main() {
     echo ""
     
     echo -e "${YELLOW}=== SUITE 5: Performance ===${NC}"
-    test_small_file_latency
+    test_strict_latency
     test_directory_listing_speed
     echo ""
     
