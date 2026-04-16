@@ -11,7 +11,6 @@ use std::{
     cmp,
     collections::HashMap,
     ffi::OsStr,
-    io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime},
@@ -31,6 +30,8 @@ use crate::{
 
 // 5 MB Read Ahead
 const PREFETCH_SIZE: u32 = 5 * 1024 * 1024; 
+// 5 MB grandezza del blocco di scrittura, per evitare di tenere in RAM file troppo grandi prima di fare flush sul server
+const CHUNK_SIZE: usize = 5 * 1024 * 1024;
 
 // CLI ARGUMENTS 
 #[derive(Parser, Debug)]
@@ -157,11 +158,8 @@ impl Filesystem for RemoteFS {
         // controllo se il file richiesto è tra quelli attualmente aperti
         if let Some(rfs_file) = self.rfs_files.get(&Inode(ino)) {
             let mut attr = FileAttrWrapper::from(rfs_file.file_entry.clone()).0;
-            // Se il file è stato modificato localmente(dirty + qualcosa nel buffer), prendiamo la dimensione reale dal disco
-            if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
-                if let Ok(metadata) = rfs_file.write_buffer.as_ref().unwrap().as_file().metadata() {
-                    attr.size = metadata.len();
-                }
+            // Se il file è stato modificato localmente(dirty)
+            if rfs_file.is_dirty  {
                 attr.mtime = SystemTime::now();
             }
             reply.attr(&self.ttl, &attr);
@@ -205,18 +203,13 @@ impl Filesystem for RemoteFS {
 
             // cerco nei file aperti
             if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
-                // Inizializza buffer su disco se non esiste
-                if rfs_file.write_buffer.is_none() {
-                    rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
-                }
-                // Truncate direttamente sul file temporaneo
-                let file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
-                if file.set_len(new_size).is_ok() {
-                    rfs_file.is_dirty = true;
-                    rfs_file.file_entry.size = new_size;
-                }
+                // Il troncamento invalida i dati pendenti nel buffer
+                rfs_file.write_buffer.clear();
+                rfs_file.write_offset = 0;
+                
+                rfs_file.is_dirty = true;
+                rfs_file.file_entry.size = new_size;
             } else {
-            
                 debug!("FUSE SETATTR: Fallimento truncate locale per Inode {}", ino);
             }
         } else {
@@ -513,8 +506,7 @@ impl Filesystem for RemoteFS {
                         flags: OpenFlags::WRITE,
                     },
                 );
-                // creo un buffer di scrittura temporaneo per tenere i dati in attesa di flush sul server
-                rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
+
                 rfs_file.is_dirty = true;
 
                 let entry_for_reply = rfs_file.file_entry.clone();
@@ -768,12 +760,6 @@ impl Filesystem for RemoteFS {
                 },
             );
 
-            // se la modalità è "WRITE" e non esiste ancora un buffer di scrittura, 
-            // lo creo per tenere i dati in attesa di flush sul server
-            if open_flags.is_write() && rfs_file.write_buffer.is_none() {
-                debug!("FUSE OPEN: Modalità scrittura rilevata per Fd {}, creato nuovo write_buffer locale", fd.0);
-                rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
-            }
             reply.opened(fd.0, 0);
         } else {
             debug!("FUSE OPEN: Fallimento, Inode {} non trovato in cache", ino);
@@ -796,23 +782,20 @@ impl Filesystem for RemoteFS {
         let inode = Inode(ino);
 
         if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
-            // se il file è stato modificato localmente (dirty) e ha un buffer di scrittura, 
-            // leggo i dati direttamente da quel buffer per garantire la coerenza dei dati letti
-            if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
-                let temp_file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
-                // posiziono il cursore del file temporaneo alla posizione richiesta
-                if temp_file.seek(SeekFrom::Start(offset as u64)).is_err() {
-                    reply.error(EIO);
-                    return;
-                }
+            // se stiamo per leggere ma ci sono dei dati in RAM non ancora salvati,
+            // forziamo un upload preventivo al server (auto-flush) per coerenza.
+            if rfs_file.is_dirty && !rfs_file.write_buffer.is_empty() {
 
-                let mut buf = vec![0u8; size as usize];
-                // leggo i dati richiesti dal file temporaneo
-                match temp_file.read(&mut buf) {
-                    Ok(n) => reply.data(&buf[0..n]),
-                    Err(_) => reply.error(EIO),
+                let path = rfs_file.file_path.to_string_lossy().to_string();
+                let data_to_send = std::mem::take(&mut rfs_file.write_buffer);
+                let current_offset = rfs_file.write_offset;
+
+                let cursor = std::io::Cursor::new(data_to_send);
+                if let Err(e) = self.cache.api.write_file(&path, cursor, current_offset) {
+                    log::error!("FUSE READ: Auto-flush fallito per '{}': {}", path, e);
                 }
-                return;
+                // Invalidiamo la cache locale di lettura perché il server ha dati nuovi
+                rfs_file.read_buffer.clear();
             }
         }
 
@@ -892,36 +875,38 @@ impl Filesystem for RemoteFS {
     ) {
         // se il file è tra quelli aperti, procedo con la scrittura
         if let Some(rfs_file) = self.rfs_files.get_mut(&Inode(ino)) {
-            // se non c'è un buffer di scrittura, lo creo per tenere i dati in attesa di flush sul server
-            if rfs_file.write_buffer.is_none() {
-                rfs_file.write_buffer = Some(tempfile::NamedTempFile::new().unwrap());
+           
+            // Se il buffer è vuoto, annotiamo da quale offset stiamo iniziando a scrivere
+            if rfs_file.write_buffer.is_empty() {
+                rfs_file.write_offset = offset as u64;
             }
 
-            // riferimento mutabile al file temporaneo 
-            let file = rfs_file.write_buffer.as_mut().unwrap().as_file_mut();
-
-            if let Some(current_min) = rfs_file.dirty_offset {
-                rfs_file.dirty_offset = Some(std::cmp::min(current_min, offset as u64));
-            } else {
-                rfs_file.dirty_offset = Some(offset as u64);
-            }
-
-            // posiziono il cursore del file temporaneo alla posizione richiesta per la scrittura
-            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
-                reply.error(EIO);
-                return;
-            }
-            // scrivo i dati passati in fase di scrittura nel file temporaneo
-            if file.write_all(data).is_err() {
-                reply.error(EIO);
-                return;
-            }
-
-            // segno il file come "dirty", cioè modificato localmente
+            // aggiungiamo i byte che vogliamo scrivere in ram
+            rfs_file.write_buffer.extend_from_slice(data);
             rfs_file.is_dirty = true;
-            if let Ok(meta) = file.metadata() {
-                // aggiorno la dimensione del file 
-                rfs_file.file_entry.size = meta.len();
+
+            // Aggiorniamo la dimensione del file per FUSE
+            let end_offset = offset as u64 + data.len() as u64;
+            if end_offset > rfs_file.file_entry.size {
+                rfs_file.file_entry.size = end_offset;
+            }
+
+            // se il buffer di scrittura ha raggiunto la dimensione del chunk, lo inviamo al server
+            if rfs_file.write_buffer.len() >= CHUNK_SIZE {
+                let path = rfs_file.file_path.to_string_lossy().to_string();
+                
+                // std::mem::take sposta i dati dal buffer senza fare cloni pesanti
+                let data_to_send = std::mem::take(&mut rfs_file.write_buffer); 
+                let current_offset = rfs_file.write_offset;
+                
+                let cursor = std::io::Cursor::new(data_to_send);
+                
+                info!("FUSE WRITE: upload al server per '{}'", path);
+                if let Err(e) = self.cache.api.write_file(&path, cursor, current_offset) {
+                    debug!("FUSE WRITE: Fallimento upload API chunk per '{}': {}", path, e);
+                    reply.error(libc::EIO);
+                    return;
+                }
             }
 
             reply.written(data.len() as u32);
@@ -936,60 +921,38 @@ impl Filesystem for RemoteFS {
 
         // vedo se il file è tra quelli aperti
         if let Some(rfs_file) = self.rfs_files.get_mut(&inode) {
-            // se il file è stato modificato localmente (dirty) e ha un buffer di scrittura,
+            // se il file è stato modificato localmente (dirty) 
             // è necessario fare il flush dei dati sul server per garantire la persistenza delle modifiche e la coerenza dei dati
-            if rfs_file.is_dirty && rfs_file.write_buffer.is_some() {
-                let temp_file = rfs_file.write_buffer.as_mut().unwrap();
+            if rfs_file.is_dirty {
                 let path = rfs_file.file_path.to_string_lossy().to_string();
 
-                // recuperiamo l'offset minimo modificato (default 0 se non impostato)
-                let min_offset = rfs_file.dirty_offset.unwrap_or(0);
-
-                // per fare il flush, riapro il file temporaneo in modalità lettura e 
-                // passo quel reader all'API di scrittura del server,
-                // in modo da inviare i dati modificati al server
-                if let Ok(mut reader) = temp_file.reopen() {
-
-                    // spostiamo il cursore per saltare i byte nulli iniziali
-                    if let Err(e) = reader.seek(SeekFrom::Start(min_offset)) {
-                        error!("FUSE FLUSH: Fallimento seek sul file locale per '{}': {}", path, e);
+                // scarichiamo al server eventuali byte rimasti nel buffer 
+                if !rfs_file.write_buffer.is_empty() {
+                    let data_to_send = std::mem::take(&mut rfs_file.write_buffer);
+                    let current_offset = rfs_file.write_offset;
+                    
+                    let cursor = std::io::Cursor::new(data_to_send);
+                    
+                    info!("FUSE FLUSH: upload al server per '{}'", path);
+                    if let Err(e) = self.cache.api.write_file(&path, cursor, current_offset) {
+                        log::error!("FUSE FLUSH: Fallimento upload ultimo pezzo per '{}': {}", path, e);
                         reply.error(libc::EIO);
                         return;
                     }
-
-                    info!("FUSE FLUSH: Avvio streaming upload al server per '{}'", path);
-                    // scrivo sul server
-                    if self.cache.api.write_file(&path, reader, min_offset).is_err() {
-                        error!("FUSE FLUSH: Fallimento upload API per '{}'", path);
-                        reply.error(EIO);
-                        return;
-                    }
-
-                    debug!("FUSE FLUSH: Upload completato con successo. Sincronizzazione metadati per Inode {}", ino);
-
-                    // sincronizzazione cache e Metadati
-                    if let Ok(meta) = temp_file.as_file().metadata() {
-                        // aggiorno il file aperto
-                        rfs_file.file_entry.size = meta.len();
-                        rfs_file.file_entry.modified_at =
-                            meta.modified().unwrap_or(SystemTime::now());
-
-                        // aggiorna cache
-                        if let Some(mut cached) = self.cache.files.get(&inode).cloned() {
-                            cached.file_entry.size = meta.len();
-                            cached.file_entry.modified_at = rfs_file.file_entry.modified_at;
-                            self.cache.files.put(inode, cached);
-                        }
-                    }
-                    
-                    // resetto il flag
-                    rfs_file.is_dirty = false;
-                    rfs_file.dirty_offset = None;
-                } else {
-                    error!("FUSE FLUSH: Fallimento reopen del file temporaneo locale per Inode {}", ino);
-                    reply.error(EIO);
-                    return;
                 }
+
+                // Sincronizzazione metadati post-upload
+                debug!("FUSE FLUSH: Upload completato con successo. Sincronizzazione metadati per Inode {}", ino);
+                rfs_file.file_entry.modified_at = std::time::SystemTime::now();
+
+                if let Some(mut cached) = self.cache.files.get(&inode).cloned() {
+                    cached.file_entry = rfs_file.file_entry.clone();
+                    self.cache.files.put(inode, cached);
+                }
+                
+                // resetto il flag
+                rfs_file.is_dirty = false;
+            
             }
         }
         reply.ok();
@@ -1022,9 +985,10 @@ impl Filesystem for RemoteFS {
             if rfs_file.fds.is_empty() {
                 is_completely_closed = true;
                 debug!("FUSE RELEASE: Nessun altro processo usa l'Inode {}. Pulizia risorse locali.", ino);
-                // se nel buffer non c'è nulla, chiudo ed elimio il tempfile
+                // se nel buffer non c'è nulla
                 if !rfs_file.is_dirty {
-                    rfs_file.write_buffer = None; // chiude ed elimina tempfile
+                    // svuota i Vec in RAM
+                    rfs_file.write_buffer.clear(); 
                     rfs_file.read_buffer.clear();
                 } else {
                     debug!("FUSE RELEASE: L'Inode {} chiuso risulta ancora 'dirty'. Possibile mancato salvataggio!", ino);

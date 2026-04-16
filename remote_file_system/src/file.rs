@@ -37,12 +37,14 @@ pub struct RfsFile {
     // mappa di tutti i fd aperti su questo file, con i relativi flag e inode
     pub fds: HashMap<Fd, OpenedFile>,
     
-    // buffer su disco per supportare file >100MB
-    pub write_buffer: Option<NamedTempFile>, 
+    // tolgo il buffer di prima e tengo i dati in ram
+    pub write_buffer: Vec<u8>, 
+
     pub is_dirty: bool,
+
     // serve per l'append, traccia l'offset a cui è iniziata la modifica, 
     // così da sapere da dove iniziare a scrivere quando arriva il flush
-    pub dirty_offset: Option<u64>, 
+    pub write_offset: u64, 
 
     pub read_buffer: Vec<u8>,
     pub read_buffer_offset: u64,
@@ -58,9 +60,9 @@ impl From<CachedFile> for RfsFile {
             file_entry: c.file_entry,
             file_path: c.file_path,
             fds: HashMap::new(),
-            write_buffer: None,
+            write_buffer: Vec::new(),
             is_dirty: false,
-            dirty_offset: None,
+            write_offset: 0,
             read_buffer: Vec::new(),
             read_buffer_offset: 0,
             unlinked: false,
