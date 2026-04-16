@@ -98,14 +98,14 @@ struct RemoteFS {
     rfs_files: HashMap<Inode, RfsFile>,
     last_fd: AtomicU64,
     // Configurazioni
-    use_cache: bool,
     ttl: Duration,
 }
 
 impl RemoteFS {
     fn new(use_cache: bool, cache_capacity: usize, ttl_secs: u64, server_url: String) -> Self {
-        let mut cache = Cache::new(cache_capacity, Duration::from_secs(ttl_secs), server_url.clone());
+        let mut cache = Cache::new(cache_capacity, Duration::from_secs(ttl_secs), server_url.clone(),  use_cache);
 
+        info!("Inizializzazione RemoteFS con cache_capacity={}, ttl={:?}, server_url={}, use_cache={}", cache_capacity, Duration::from_secs(ttl_secs), server_url, use_cache);
         // Inizializziamo manualmente la Root (Inode 1)
         cache.files.put(
             Inode(1),
@@ -126,7 +126,6 @@ impl RemoteFS {
             cache,
             rfs_files: HashMap::new(),
             last_fd: AtomicU64::new(10),
-            use_cache,
             ttl: Duration::from_secs(ttl_secs),
         }
     }
