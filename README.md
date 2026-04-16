@@ -33,6 +33,11 @@ echo "Hello Remote World" > test.txt
 cat test.txt
 ```
 
+Per visualizzare i log del server:
+```Bash
+docker logs -f rfs-server
+```
+
 # 🛠 Comandi Utili
 ## Monitoraggio
 Log del Server: docker logs -f rfs-server
