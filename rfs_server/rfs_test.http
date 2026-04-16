@@ -45,3 +45,30 @@ DELETE {{api_base}}/files/put_test.txt HTTP/1.1
 # Elimina la directory e, poiché usa fs::remove_dir_all, dovrebbe essere ricorsiva (anche se qui è vuota).
 
 DELETE {{api_base}}/files/nuova_cartella HTTP/1.1
+
+
+
+### 9. Test Append - Passo 1: Scrittura iniziale (Offset 0)
+# Simuliamo 'echo "Prima riga" > file'. Il server deve creare e/o troncare il file.
+PUT {{api_base}}/files/test_append_server.txt HTTP/1.1
+Content-Type: application/octet-stream
+x-write-offset: 0
+
+Prima riga
+
+### 10. Test Append - Passo 2: Aggiunta (Offset 10)
+# Simuliamo l'append. Usiamo offset 10 (la lunghezza di "Prima riga" senza a capo).
+# Il server NON deve troncare, ma posizionarsi al byte 10 e scrivere.
+PUT {{api_base}}/files/test_append_server.txt HTTP/1.1
+Content-Type: application/octet-stream
+x-write-offset: 10
+
+Seconda riga
+
+### 11. Test Append - Passo 3: Verifica
+# Leggiamo il risultato finale. 
+GET {{api_base}}/files/test_append_server.txt HTTP/1.1
+
+### 12. Test di Cancellazione di un File (DELETE /files/)
+
+DELETE {{api_base}}/files/test_append_server.txt HTTP/1.1

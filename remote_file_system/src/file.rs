@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 use shared::file_entry::FileEntry;
 use crate::{cache::{CachedFile, Inode}, Fd};
+use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenFlags(i32);
@@ -9,6 +10,7 @@ impl OpenFlags {
     pub const READ: OpenFlags = OpenFlags(1);
     pub const WRITE: OpenFlags = OpenFlags(2);
     
+    /// Converte i flag di apertura di FUSE (O_RDONLY, O_WRONLY, O_RDWR) in OpenFlags personalizzati (WRITE o READ)
     pub fn from_flags(flags: i32) -> Self {
         let acc_mode = flags & libc::O_ACCMODE;
         if acc_mode == libc::O_WRONLY || acc_mode == libc::O_RDWR {
@@ -27,21 +29,26 @@ pub struct OpenedFile {
     pub flags: OpenFlags,
 }
 
-#[derive(Debug, Clone)]
+
+#[derive(Debug)] 
 pub struct RfsFile {
     pub file_entry: FileEntry,
     pub file_path: PathBuf,
+    // mappa di tutti i fd aperti su questo file, con i relativi flag e inode
     pub fds: HashMap<Fd, OpenedFile>,
     
-    // Buffer per SCRITTURA
-    pub write_buffer: Option<Vec<u8>>, 
+    // buffer su disco per supportare file >100MB
+    pub write_buffer: Option<NamedTempFile>, 
     pub is_dirty: bool,
+    // serve per l'append, traccia l'offset a cui è iniziata la modifica, 
+    // così da sapere da dove iniziare a scrivere quando arriva il flush
+    pub dirty_offset: Option<u64>, 
 
-    // Buffer per LETTURA
     pub read_buffer: Vec<u8>,
     pub read_buffer_offset: u64,
 
-    // NUOVO: Flag per gestione unlink su file aperti
+    // per soft delete: se un file è stato cancellato ma è ancora aperto da qualche altra parte,
+    // lo teniamo in memoria finché non viene chiuso
     pub unlinked: bool,
 }
 
@@ -53,9 +60,10 @@ impl From<CachedFile> for RfsFile {
             fds: HashMap::new(),
             write_buffer: None,
             is_dirty: false,
+            dirty_offset: None,
             read_buffer: Vec::new(),
             read_buffer_offset: 0,
-            unlinked: false, // Inizializza a false
+            unlinked: false,
         }
     }
 }

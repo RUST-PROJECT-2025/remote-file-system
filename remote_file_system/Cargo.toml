@@ -13,17 +13,8 @@ edition = "2024"
  reqwest = {version = "0.12.25", features = ["blocking", "json"]}
  shared = { path = "../shared" }
 
-# [package]
-# name = "remote_file_system"
-# version = "0.1.0"
-# edition = "2021"
-
-# [dependencies]
-# fuser = "0.12" # o versione compatibile
-# libc = "0.2"
-# reqwest = { version = "0.11", features = ["blocking", "json"] }
-# serde = { version = "1.0", features = ["derive"] }
-# serde_json = "1.0"
-# env_logger = "0.10"
-# log = "0.4"
-# shared = { path = "../shared" }
+clap = { version = "4.4", features = ["derive"] } # Parsing argomenti CLI
+lru = "0.12"                                     # Cache LRU
+daemonize = "0.5"                                # Esecuzione in background
+ctrlc = "3.4"                                    # Gestione segnali (Graceful Shutdown)
+tempfile = "3.8"                                 # Supporto file grandi (buffer su disco)
