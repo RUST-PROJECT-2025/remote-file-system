@@ -260,7 +260,13 @@ impl Filesystem for RemoteFS {
                 0,
             ),
             None => {
+                // Su macOS risolve l'errore del comando 'mv'
+                #[cfg(target_os = "macos")]
+                reply.error(ENOENT);
+
+                // Su Linux manteniamo 
                 // Diciamo al Kernel: "Non c'è, ma non ricordartelo! Chiedimelo sempre."  --> per bug di Negative Cache
+                #[cfg(target_os = "linux")]
                 reply.entry(
                     &Duration::from_secs(0),
                     &FileAttr {
@@ -1138,15 +1144,18 @@ fn main() {
         mountpoint, !args.no_cache, args.ttl
     );
 
-    // mount del file system, con le opzioni per il nome del file system, auto unmount e allow other
+    // Opzioni di base per il mount
+    #[allow(unused_mut)]
+    let mut options = vec![
+        MountOption::FSName("remote_fs".to_string()),
+        MountOption::AutoUnmount,
+    ];
+    
+
     if let Err(e) = fuser::mount2(
         fs,
         &mountpoint,
-        &[
-            MountOption::FSName("remote_fs".to_string()),
-            MountOption::AutoUnmount,
-            MountOption::AllowOther,
-        ],
+        &options,
     ) {
         error!("Errore mount: {}", e);
     }
