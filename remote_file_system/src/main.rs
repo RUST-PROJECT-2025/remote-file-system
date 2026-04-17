@@ -1046,68 +1046,44 @@ fn main() {
 
     // gestione graceful shutdown 
     let mp_handler = mountpoint.clone();
-    /*ctrlc::set_handler(move || {
-        info!("Segnale di interruzione ricevuto. Smontaggio in corso...");
-        
-        // Tentativo di smontaggio "pigro" (lazy)
-        /*let _ = Command::new("umount")
-            .arg("-l")
-            .arg(&mp_handler)
-            .status();
 
-        info!("Smontaggio richiesto al kernel. Uscita forzata del processo.");
-        // Senza questo exit(0), il loop di fuser potrebbe restare appeso
-        exit(0);*/
-        #[cfg(target_os = "linux")]
-        {
-            let status = std::process::Command::new("fusermount3")
-                .arg("-u")
-                .arg(&mp_handler)
-                .status();
-            
-            if status.is_ok() && status.unwrap().success() {
-                info!("Smontaggio riuscito con fusermount3.");
-                std::process::exit(0);
-            }
-        }
-
-        // Su macOS (o come fallback su Linux) usa umount
-        info!("Eseguendo smontaggio con umount...");
-        let status = std::process::Command::new("umount")
-            .arg(&mp_handler)
-            .status();
-
-        if status.is_ok() && status.unwrap().success() {
-            info!("Smontaggio riuscito.");
-        } else {
-            error!("Smontaggio FALLITO. Potrebbe essere necessario smontare manualmente.");
-        }
-        
-
-    }).expect("Errore nell'impostazione del gestore segnali");
-*/
 
     ctrlc::set_handler(move || {
         info!("Segnale di interruzione ricevuto. Smontaggio in corso...");
-        
-        // Su macOS usa direttamente umount senza cercare fusermount3
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("umount")
-                .arg(&mp_handler)
-                .status();
-        }
-
+            
+        // Logica di smontaggio per LINUX
         #[cfg(target_os = "linux")]
-        {
-            let _ = std::process::Command::new("fusermount3")
-                .arg("-u")
-                .arg(&mp_handler)
-                .status();
-        }
+        let status = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&mp_handler)
+            .status()
+            .unwrap_or_else(|_| {
+                std::process::Command::new("umount")
+                    .arg(&mp_handler)
+                    .status()
+                    .expect("Comandi di smontaggio non trovati")
+            });
 
-        info!("Uscita forzata del processo.");
-        std::process::exit(0);
+        // Logica di smontaggio per MACOS
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("diskutil")
+            .arg("unmount")
+            .arg("force")
+            .arg(&mp_handler)
+            .status()
+            .unwrap_or_else(|_| {
+                std::process::Command::new("umount")
+                    .arg(&mp_handler)
+                    .status()
+                    .expect("Comandi di smontaggio non trovati")
+            });
+
+
+        if status.success() {
+            info!("Comando di smontaggio inviato al kernel. Il loop FUSE si chiuderà a breve.");
+        } else {
+            error!("Smontaggio FALLITO (Device Busy). Assicurati che nessun terminale o programma stia usando il mount point.");
+        }
     }).expect("Errore nell'impostazione del gestore segnali");
 
 
@@ -1129,10 +1105,12 @@ fn main() {
                 }
             }
         }
+
         #[cfg(target_os = "macos")]
-        {
-            panic!("La modalità daemon non è supportata su macOS. Rimuovi il flag --daemon.");
-        }
+        if args.daemon {
+            log::warn!("La modalità daemon non è supportata su macOS. Esecuzione in foreground.");
+        
+        } 
     }
 
     // inizializzo il file system, passando i parametri di configurazione per la cache
@@ -1155,6 +1133,8 @@ fn main() {
         MountOption::AutoUnmount,
     ];
     
+    #[cfg(target_os = "linux")]
+    options.push(MountOption::AllowOther);
 
     if let Err(e) = fuser::mount2(
         fs,
