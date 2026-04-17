@@ -153,7 +153,7 @@ impl Filesystem for RemoteFS {
     // METADATA
 
     /// ritorna i metadati specificando l'Inode del file
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
 
         // controllo se il file richiesto è tra quelli attualmente aperti
         if let Some(rfs_file) = self.rfs_files.get(&Inode(ino)) {
@@ -216,7 +216,7 @@ impl Filesystem for RemoteFS {
             debug!("FUSE SETATTR: Richiesto truncate su Inode {} ma il file non è nei rfs_files (non aperto)", ino);
         }
         // restituisco i metadati aggiornati 
-        self.getattr(_req, ino, None, reply);
+        self.getattr(_req, ino, reply);
     }
 
 
@@ -740,7 +740,11 @@ impl Filesystem for RemoteFS {
             }
             Err(e) => {
                 error!("FUSE RENAME: Fallimento API per rinomina '{}' -> '{}': {}", old_path, new_name_str, e);
-                reply.error(EIO)
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    reply.error(ENOENT)
+                } else {
+                    reply.error(EIO)
+                }
             },
         }
     }
