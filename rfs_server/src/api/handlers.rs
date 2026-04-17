@@ -69,7 +69,7 @@ pub async fn write_file_contents(req: HttpRequest, path: SafePath, mut payload: 
         .unwrap_or(0);
 
 
-    info!("SERVER WRITE: Ricevuta richiesta PUT per '{:?}' con offset: {}", full_path, offset);
+    //info!("SERVER WRITE: Ricevuta richiesta PUT per '{:?}' con offset: {}", full_path, offset);
     
     // se il file esiste già, lo apro in modalità append e mi posiziono all'offset specificato
     let mut options = OpenOptions::new();
