@@ -684,9 +684,12 @@ impl Filesystem for RemoteFS {
             .to_string_lossy()
             .to_string();
 
-        let new_name_str = new_name.to_string_lossy().to_string();
 
         let new_full_path = PathBuf::from(&new_parent_path).join(new_name);
+        let mut new_name_str = new_full_path.to_string_lossy().to_string();
+        if !new_name_str.starts_with('/') {
+            new_name_str = format!("/{}", new_name_str);
+        }
 
         info!("FUSE RENAME: '{}' -> '{}'", old_path, new_full_path.display());
         // passiamo new_name_str all'API

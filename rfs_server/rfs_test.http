@@ -72,3 +72,52 @@ GET {{api_base}}/files/test_append_server.txt HTTP/1.1
 ### 12. Test di Cancellazione di un File (DELETE /files/)
 
 DELETE {{api_base}}/files/test_append_server.txt HTTP/1.1
+
+
+### =========================================
+### TEST RENAME E MOVE (MV)
+### =========================================
+
+### 13. Creazione file da rinominare
+PUT {{api_base}}/files/da_rinominare.txt HTTP/1.1
+Content-Type: application/octet-stream
+x-write-offset: 0
+
+Questo file cambierà nome e cartella.
+
+### 14. Test RENAME Semplice (PATCH /files/)
+# Cambia solo il nome del file. Dato che non c'è una "/" all'inizio di new_name,
+# il server capisce che deve mantenerlo nella sua cartella attuale (la root).
+PATCH {{api_base}}/files/da_rinominare.txt HTTP/1.1
+Content-Type: application/json
+
+{
+    "new_name": "rinominato.txt"
+}
+
+### 15. Verifica del RENAME (GET /files/)
+# Controlliamo che il file esista con il nuovo nome. (Dovrebbe restituire 200 OK)
+GET {{api_base}}/files/rinominato.txt HTTP/1.1
+
+### 16. Preparazione per la MOVE: Creazione cartella di destinazione
+# Creiamo una cartella dove sposteremo il file.
+POST {{api_base}}/mkdir/cartella_destinazione HTTP/1.1
+
+### 17. Test MOVE (Spostamento in altra cartella)
+# Spostiamo il file rinominato dentro la nuova cartella.
+# Dato che new_name inizia con "/", il server la interpreta come un percorso assoluto (MOVE).
+PATCH {{api_base}}/files/rinominato.txt HTTP/1.1
+Content-Type: application/json
+
+{
+    "new_name": "/cartella_destinazione/file_spostato.txt"
+}
+
+### 18. Verifica della MOVE - Controllo file originale (GET /files/)
+# Verifichiamo che il file NON si trovi più nella root. (Dovrebbe restituire 404 Not Found)
+GET {{api_base}}/files/rinominato.txt HTTP/1.1
+
+### 19. Verifica della MOVE - Lettura destinazione (GET /files/)
+# Verifichiamo che il file si trovi nel nuovo percorso e leggiamo il contenuto.
+GET {{api_base}}/files/cartella_destinazione/file_spostato.txt HTTP/1.1
+

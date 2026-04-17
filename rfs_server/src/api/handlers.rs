@@ -123,10 +123,27 @@ pub struct RenameRequest { new_name: String }
 
 pub async fn rename_file_or_directory(path: SafePath, body: Json<RenameRequest>) -> Result<HttpResponse, actix_web::Error> {
     let full_path = path.into_inner();
+    info!("SERVER RENAME: Ricevuta richiesta PATCH per '{:?}' con nuovo nome '{}'", full_path, body.new_name);
+    
     if !full_path.exists() { return Ok(HttpResponse::NotFound().finish()); }
 
-    let parent = full_path.parent().ok_or(ErrorBadRequest("Invalid path"))?;
-    let new_path = parent.join(&body.new_name);
+
+    // controllo se il nuovo nome inizia con "/" -> è una move
+    let new_path = if body.new_name.starts_with('/') {
+        
+        // recupero la cartella radice del server 
+        let storage_root = std::env::var("RFS_STORAGE_PATH")
+            .unwrap_or_else(|_| "/tmp/rfs_storage".to_string());
+
+        // tolgo lo "/" iniziale per non "rompere" il join di PathBuf
+        let safe_logical_path = body.new_name.trim_start_matches('/');
+        std::path::PathBuf::from(storage_root).join(safe_logical_path)
+
+    } else {
+        // È un rename
+        let parent = full_path.parent().ok_or(ErrorBadRequest("Invalid path"))?;
+        parent.join(&body.new_name)    
+    };
 
     fs::rename(full_path, new_path).await.map_err(|e| ErrorInternalServerError(e))?;
     Ok(HttpResponse::Ok().finish())
@@ -196,5 +213,73 @@ mod tests {
         let req_check = test::TestRequest::get().uri("/api/files/todelete.txt").to_request();
         let resp_check = test::call_service(&app, req_check).await;
         assert_eq!(resp_check.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[actix_web::test]
+    async fn test_rename_file() {
+        setup_test_env();
+        let app = test::init_service(App::new().configure(config_routes)).await;
+
+        // 1. Creiamo un file iniziale
+        let req_put = test::TestRequest::put()
+            .uri("/api/files/old_name.txt")
+            .set_payload("Contenuto da rinominare")
+            .to_request();
+        test::call_service(&app, req_put).await;
+
+        // 2. Chiamata PATCH per rinominarlo (inviamo solo il nuovo nome, senza '/')
+        let rename_payload = serde_json::json!({ "new_name": "new_name.txt" });
+        let req_rename = test::TestRequest::patch()
+            .uri("/api/files/old_name.txt")
+            .set_json(&rename_payload)
+            .to_request();
+        let resp_rename = test::call_service(&app, req_rename).await;
+        assert_eq!(resp_rename.status(), StatusCode::OK);
+
+        // 3. Verifichiamo che il vecchio file non esista più
+        let req_check_old = test::TestRequest::get().uri("/api/files/old_name.txt").to_request();
+        let resp_check_old = test::call_service(&app, req_check_old).await;
+        assert_eq!(resp_check_old.status(), StatusCode::NOT_FOUND);
+
+        // 4. Verifichiamo che il nuovo file esista e abbia il contenuto corretto
+        let req_check_new = test::TestRequest::get().uri("/api/files/new_name.txt").to_request();
+        let resp_body = test::call_and_read_body(&app, req_check_new).await;
+        assert_eq!(resp_body, web::Bytes::from_static(b"Contenuto da rinominare"));
+    }
+
+    #[actix_web::test]
+    async fn test_move_file_to_different_directory() {
+        setup_test_env();
+        let app = test::init_service(App::new().configure(config_routes)).await;
+
+        // 1. Creiamo la directory di destinazione
+        let req_mkdir = test::TestRequest::post().uri("/api/mkdir/target_folder").to_request();
+        test::call_service(&app, req_mkdir).await;
+
+        // 2. Creiamo il file originale nella root
+        let req_put = test::TestRequest::put()
+            .uri("/api/files/to_move.txt")
+            .set_payload("Contenuto da spostare")
+            .to_request();
+        test::call_service(&app, req_put).await;
+
+        // 3. Eseguiamo il MOVE inviando un percorso assoluto (inizia con '/')
+        let move_payload = serde_json::json!({ "new_name": "/target_folder/moved.txt" });
+        let req_move = test::TestRequest::patch()
+            .uri("/api/files/to_move.txt")
+            .set_json(&move_payload)
+            .to_request();
+        let resp_move = test::call_service(&app, req_move).await;
+        assert_eq!(resp_move.status(), StatusCode::OK);
+
+        // 4. Verifichiamo che il file originario non sia più nella root
+        let req_check_old = test::TestRequest::get().uri("/api/files/to_move.txt").to_request();
+        let resp_check_old = test::call_service(&app, req_check_old).await;
+        assert_eq!(resp_check_old.status(), StatusCode::NOT_FOUND);
+
+        // 5. Verifichiamo che si trovi nella nuova cartella
+        let req_check_new = test::TestRequest::get().uri("/api/files/target_folder/moved.txt").to_request();
+        let resp_body = test::call_and_read_body(&app, req_check_new).await;
+        assert_eq!(resp_body, web::Bytes::from_static(b"Contenuto da spostare"));
     }
 }
