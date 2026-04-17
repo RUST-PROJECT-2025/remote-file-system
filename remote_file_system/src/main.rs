@@ -1038,16 +1038,35 @@ fn main() {
         info!("Segnale di interruzione ricevuto. Smontaggio in corso...");
         
         // Tentativo di smontaggio "pigro" (lazy)
-        let _ = Command::new("umount")
+        /*let _ = Command::new("umount")
             .arg("-l")
             .arg(&mp_handler)
             .status();
 
         info!("Smontaggio richiesto al kernel. Uscita forzata del processo.");
         // Senza questo exit(0), il loop di fuser potrebbe restare appeso
-        exit(0);
-    }).expect("Errore nell'impostazione del gestore segnali");
+        exit(0);*/
 
+
+        let status = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&mp_handler)
+            .status()
+            .unwrap_or_else(|_| {
+                // Fallback se fusermount3 non c'è
+                std::process::Command::new("umount")
+                    .arg(&mp_handler)
+                    .status()
+                    .expect("Comandi di smontaggio non trovati")
+            });
+
+        if status.success() {
+            info!("Comando di smontaggio inviato al kernel. Il loop FUSE si chiuderà a breve.");
+        } else {
+            error!("Smontaggio FALLITO (Device Busy). Assicurati che nessun terminale o programma stia usando /mnt/remote-fs");
+        }
+
+    }).expect("Errore nell'impostazione del gestore segnali");
     if args.daemon {
         // salvo i log
         let log_file = std::fs::File::create("/tmp/rfs.log").unwrap();
