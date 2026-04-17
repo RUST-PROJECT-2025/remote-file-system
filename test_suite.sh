@@ -504,6 +504,88 @@ test_directory_listing_speed() {
     fi
 }
 
+test_large_files_io_and_latency() {
+    log_test "Large Files I/O & Strict Latency (100MB, 300MB, 500MB)"
+    
+    local sizes=(100 300 500)
+    local all_passed=true
+    
+    for size in "${sizes[@]}"; do
+        local test_file="$MOUNT_POINT/file_${size}MB_${RANDOM}.bin"
+        log_info "--- Inizio test su file da ${size} MB ---"
+        
+        # 1. Scrittura Sequenziale Completa (Throughput)
+        local start_write=$(date +%s%3N)
+        dd if=/dev/zero of="$test_file" bs=1M count=$size 2>/dev/null
+        local end_write=$(date +%s%3N)
+        local elapsed_write=$((end_write - start_write))
+        
+        local throughput_write=0
+        if [ $elapsed_write -gt 0 ]; then
+            throughput_write=$(( (size * 1000) / elapsed_write ))
+        fi
+        log_info "Scrittura totale completata in ${elapsed_write}ms (~${throughput_write} MB/s)"
+        
+        # Verifica che il file esista prima di procedere
+        if [ ! -f "$test_file" ]; then
+            log_fail "Scrittura fallita: il file da ${size}MB non è stato creato"
+            all_passed=false
+            continue
+        fi
+
+        # 2. Latenza Micro-Lettura (<500ms)
+        # Leggiamo solo i primi 4KB. Se il chunking funziona, non scaricherà tutto il file.
+        local start_lat_read=$(date +%s%3N)
+        head -c 4096 "$test_file" > /dev/null
+        local end_lat_read=$(date +%s%3N)
+        local elapsed_lat_read=$((end_lat_read - start_lat_read))
+        
+        if [ $elapsed_lat_read -lt 500 ]; then
+            log_pass "Latenza di micro-lettura: ${elapsed_lat_read}ms (Requisito <500ms SODDISFATTO)"
+        else
+            log_fail "Latenza micro-lettura TROPPO ALTA: ${elapsed_lat_read}ms (Atteso <500ms)"
+            all_passed=false
+        fi
+
+        # 3. Latenza Micro-Append (<500ms)
+        # Aggiungiamo pochi byte alla fine del file gigante
+        local start_lat_write=$(date +%s%3N)
+        echo "Append test" >> "$test_file"
+        local end_lat_write=$(date +%s%3N)
+        local elapsed_lat_write=$((end_lat_write - start_lat_write))
+        
+        if [ $elapsed_lat_write -lt 500 ]; then
+            log_pass "Latenza di micro-append: ${elapsed_lat_write}ms (Requisito <500ms SODDISFATTO)"
+        else
+            log_fail "Latenza micro-append TROPPO ALTA: ${elapsed_lat_write}ms (Atteso <500ms)"
+            all_passed=false
+        fi
+
+        # 4. Lettura Sequenziale Completa (Throughput)
+        # Usiamo cat direzionato a null per forzare FUSE a leggere tutti i chunk
+        local start_read=$(date +%s%3N)
+        cat "$test_file" > /dev/null
+        local end_read=$(date +%s%3N)
+        local elapsed_read=$((end_read - start_read))
+        
+        local throughput_read=0
+        if [ $elapsed_read -gt 0 ]; then
+            throughput_read=$(( (size * 1000) / elapsed_read ))
+        fi
+        log_info "Lettura totale completata in ${elapsed_read}ms (~${throughput_read} MB/s)"
+
+        # Pulizia per non esaurire lo spazio sul disco
+        rm "$test_file"
+        sleep 1 # Breve pausa per far stabilizzare il server tra un file e l'altro
+    done
+    
+    if [ "$all_passed" = true ]; then
+        log_pass "Tutti i test su file di grandi dimensioni completati con successo"
+    else
+        return 1
+    fi
+}
+
 ##############################################################################
 # Test Suite 6: Caching
 ##############################################################################
@@ -701,11 +783,7 @@ test_graceful_shutdown() {
     fi
     sleep 2
     
-    # FIX: Il server Rust "hardcoda" /tmp/rfs_storage ignorando la variabile d'ambiente!
-    # Andiamo a leggere fisicamente dove sappiamo che il server scriverà.
-    local HARDCODED_SERVER_DIR="/tmp/rfs_storage"
-    
-    if [ "$(cat "$HARDCODED_SERVER_DIR/$file_name" 2>/dev/null)" = "Dati salvati prima dello spegnimento" ]; then
+    if [ "$(cat "$SERVER_STORAGE/$file_name" 2>/dev/null)" = "Dati salvati prima dello spegnimento" ]; then
         log_pass "I dati sono stati flushati al server prima della terminazione"
     else
         log_fail "Dati persi, il client non ha completato il flush in chiusura"
@@ -801,6 +879,7 @@ main() {
     echo -e "${YELLOW}=== SUITE 5: Performance ===${NC}"
     test_strict_latency
     test_directory_listing_speed
+    test_large_files_io_and_latency
     echo ""
     
     echo -e "${YELLOW}=== SUITE 6: Caching ===${NC}"
