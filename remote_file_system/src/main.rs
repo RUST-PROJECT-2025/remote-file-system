@@ -1,4 +1,5 @@
 use clap::Parser;
+#[cfg(target_os = "linux")]
 use daemonize::Daemonize;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -1024,9 +1025,10 @@ impl Filesystem for RemoteFS {
 
 fn main() {
     //env_logger::builder().filter_level(log::LevelFilter::Info).init();
-    env_logger::builder()
+    /*env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
-        .init();
+        .init();*/
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
 
     let args = Args::parse();
@@ -1034,7 +1036,7 @@ fn main() {
 
     // gestione graceful shutdown 
     let mp_handler = mountpoint.clone();
-    ctrlc::set_handler(move || {
+    /*ctrlc::set_handler(move || {
         info!("Segnale di interruzione ricevuto. Smontaggio in corso...");
         
         // Tentativo di smontaggio "pigro" (lazy)
@@ -1046,41 +1048,80 @@ fn main() {
         info!("Smontaggio richiesto al kernel. Uscita forzata del processo.");
         // Senza questo exit(0), il loop di fuser potrebbe restare appeso
         exit(0);*/
-
-
-        let status = std::process::Command::new("fusermount3")
-            .arg("-u")
-            .arg(&mp_handler)
-            .status()
-            .unwrap_or_else(|_| {
-                // Fallback se fusermount3 non c'è
-                std::process::Command::new("umount")
-                    .arg(&mp_handler)
-                    .status()
-                    .expect("Comandi di smontaggio non trovati")
-            });
-
-        if status.success() {
-            info!("Comando di smontaggio inviato al kernel. Il loop FUSE si chiuderà a breve.");
-        } else {
-            error!("Smontaggio FALLITO (Device Busy). Assicurati che nessun terminale o programma stia usando /mnt/remote-fs");
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mp_handler)
+                .status();
+            
+            if status.is_ok() && status.unwrap().success() {
+                info!("Smontaggio riuscito con fusermount3.");
+                std::process::exit(0);
+            }
         }
 
+        // Su macOS (o come fallback su Linux) usa umount
+        info!("Eseguendo smontaggio con umount...");
+        let status = std::process::Command::new("umount")
+            .arg(&mp_handler)
+            .status();
+
+        if status.is_ok() && status.unwrap().success() {
+            info!("Smontaggio riuscito.");
+        } else {
+            error!("Smontaggio FALLITO. Potrebbe essere necessario smontare manualmente.");
+        }
+        
+
     }).expect("Errore nell'impostazione del gestore segnali");
-    if args.daemon {
-        // salvo i log
-        let log_file = std::fs::File::create("/tmp/rfs.log").unwrap();
-        match Daemonize::new()
-            .pid_file("/tmp/rfs.pid")
-            .stdout(log_file.try_clone().unwrap())
-            .stderr(log_file)
-            .start()
+*/
+
+    ctrlc::set_handler(move || {
+        info!("Segnale di interruzione ricevuto. Smontaggio in corso...");
+        
+        // Su macOS usa direttamente umount senza cercare fusermount3
+        #[cfg(target_os = "macos")]
         {
-            Ok(_) => info!("Daemon avviato."),
-            Err(e) => {
-                eprintln!("Errore daemonize: {}", e);
-                return;
+            let _ = std::process::Command::new("umount")
+                .arg(&mp_handler)
+                .status();
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mp_handler)
+                .status();
+        }
+
+        info!("Uscita forzata del processo.");
+        std::process::exit(0);
+    }).expect("Errore nell'impostazione del gestore segnali");
+
+
+    if args.daemon {
+        #[cfg(target_os = "linux")]
+        {
+            // salvo i log
+            let log_file = std::fs::File::create("/tmp/rfs.log").unwrap();
+            match Daemonize::new()
+                .pid_file("/tmp/rfs.pid")
+                .stdout(log_file.try_clone().unwrap())
+                .stderr(log_file)
+                .start()
+            {
+                Ok(_) => info!("Daemon avviato."),
+                Err(e) => {
+                    eprintln!("Errore daemonize: {}", e);
+                    return;
+                }
             }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            panic!("La modalità daemon non è supportata su macOS. Rimuovi il flag --daemon.");
         }
     }
 

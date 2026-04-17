@@ -15,6 +15,7 @@ pub struct FileEntry {
 impl FileEntry {
     // Metodo per convertire i metadati del file system locale in FileEntry
     pub fn from_metadata(name: String, metadata: std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
         FileEntry {
             ino: metadata.ino(),
             name,
