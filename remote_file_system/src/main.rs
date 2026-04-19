@@ -583,7 +583,9 @@ impl Filesystem for RemoteFS {
                             rfs_file.unlinked = true;
                             rfs_file.file_path = PathBuf::from(&parent_path).join(&new_name);
                         }
-                        let _ = self.cache.list_dir(&parent_path);
+                        //let _ = self.cache.list_dir(&parent_path);
+                        self.cache.invalidate_dir(&parent_path);
+
                         reply.ok();
                     }
                     Err(e) => {
