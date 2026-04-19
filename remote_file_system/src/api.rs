@@ -177,6 +177,9 @@ impl Api {
             
         if resp.status().is_success() {
             Ok(())
+        } else if resp.status() == StatusCode::NOT_FOUND {
+            debug!("API PATCH rename: File non trovato (404) per {}", path);
+            Err(ErrorKind::NotFound.into())
         } else {
             error!("API PATCH rename fallita per {}: HTTP {}", path, resp.status());
             Err(ErrorKind::Other.into())

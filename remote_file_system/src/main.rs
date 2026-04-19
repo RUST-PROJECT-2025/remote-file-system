@@ -1,4 +1,5 @@
 use clap::Parser;
+#[cfg(target_os = "linux")]
 use daemonize::Daemonize;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -152,7 +153,7 @@ impl Filesystem for RemoteFS {
     // METADATA
 
     /// ritorna i metadati specificando l'Inode del file
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
 
         // controllo se il file richiesto è tra quelli attualmente aperti
         if let Some(rfs_file) = self.rfs_files.get(&Inode(ino)) {
@@ -215,7 +216,7 @@ impl Filesystem for RemoteFS {
             debug!("FUSE SETATTR: Richiesto truncate su Inode {} ma il file non è nei rfs_files (non aperto)", ino);
         }
         // restituisco i metadati aggiornati 
-        self.getattr(_req, ino, None, reply);
+        self.getattr(_req, ino, reply);
     }
 
 
@@ -259,7 +260,13 @@ impl Filesystem for RemoteFS {
                 0,
             ),
             None => {
+                // Su macOS risolve l'errore del comando 'mv'
+                #[cfg(target_os = "macos")]
+                reply.error(ENOENT);
+
+                // Su Linux manteniamo 
                 // Diciamo al Kernel: "Non c'è, ma non ricordartelo! Chiedimelo sempre."  --> per bug di Negative Cache
+                #[cfg(target_os = "linux")]
                 reply.entry(
                     &Duration::from_secs(0),
                     &FileAttr {
@@ -576,7 +583,9 @@ impl Filesystem for RemoteFS {
                             rfs_file.unlinked = true;
                             rfs_file.file_path = PathBuf::from(&parent_path).join(&new_name);
                         }
-                        let _ = self.cache.list_dir(&parent_path);
+                        //let _ = self.cache.list_dir(&parent_path);
+                        self.cache.invalidate_dir(&parent_path);
+
                         reply.ok();
                     }
                     Err(e) => {
@@ -733,7 +742,11 @@ impl Filesystem for RemoteFS {
             }
             Err(e) => {
                 error!("FUSE RENAME: Fallimento API per rinomina '{}' -> '{}': {}", old_path, new_name_str, e);
-                reply.error(EIO)
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    reply.error(ENOENT)
+                } else {
+                    reply.error(EIO)
+                }
             },
         }
     }
@@ -1024,9 +1037,10 @@ impl Filesystem for RemoteFS {
 
 fn main() {
     //env_logger::builder().filter_level(log::LevelFilter::Info).init();
-    env_logger::builder()
+    /*env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
-        .init();
+        .init();*/
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
 
     let args = Args::parse();
@@ -1034,54 +1048,71 @@ fn main() {
 
     // gestione graceful shutdown 
     let mp_handler = mountpoint.clone();
+
+
     ctrlc::set_handler(move || {
         info!("Segnale di interruzione ricevuto. Smontaggio in corso...");
-        
-        // Tentativo di smontaggio "pigro" (lazy)
-        /*let _ = Command::new("umount")
-            .arg("-l")
-            .arg(&mp_handler)
-            .status();
-
-        info!("Smontaggio richiesto al kernel. Uscita forzata del processo.");
-        // Senza questo exit(0), il loop di fuser potrebbe restare appeso
-        exit(0);*/
-
-
+            
+        // Logica di smontaggio per LINUX
+        #[cfg(target_os = "linux")]
         let status = std::process::Command::new("fusermount3")
             .arg("-u")
             .arg(&mp_handler)
             .status()
             .unwrap_or_else(|_| {
-                // Fallback se fusermount3 non c'è
                 std::process::Command::new("umount")
                     .arg(&mp_handler)
                     .status()
                     .expect("Comandi di smontaggio non trovati")
             });
 
+        // Logica di smontaggio per MACOS
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("diskutil")
+            .arg("unmount")
+            .arg("force")
+            .arg(&mp_handler)
+            .status()
+            .unwrap_or_else(|_| {
+                std::process::Command::new("umount")
+                    .arg(&mp_handler)
+                    .status()
+                    .expect("Comandi di smontaggio non trovati")
+            });
+
+
         if status.success() {
             info!("Comando di smontaggio inviato al kernel. Il loop FUSE si chiuderà a breve.");
         } else {
-            error!("Smontaggio FALLITO (Device Busy). Assicurati che nessun terminale o programma stia usando /mnt/remote-fs");
+            error!("Smontaggio FALLITO (Device Busy). Assicurati che nessun terminale o programma stia usando il mount point.");
         }
-
     }).expect("Errore nell'impostazione del gestore segnali");
+
+
     if args.daemon {
-        // salvo i log
-        let log_file = std::fs::File::create("/tmp/rfs.log").unwrap();
-        match Daemonize::new()
-            .pid_file("/tmp/rfs.pid")
-            .stdout(log_file.try_clone().unwrap())
-            .stderr(log_file)
-            .start()
+        #[cfg(target_os = "linux")]
         {
-            Ok(_) => info!("Daemon avviato."),
-            Err(e) => {
-                eprintln!("Errore daemonize: {}", e);
-                return;
+            // salvo i log
+            let log_file = std::fs::File::create("/tmp/rfs.log").unwrap();
+            match Daemonize::new()
+                .pid_file("/tmp/rfs.pid")
+                .stdout(log_file.try_clone().unwrap())
+                .stderr(log_file)
+                .start()
+            {
+                Ok(_) => info!("Daemon avviato."),
+                Err(e) => {
+                    eprintln!("Errore daemonize: {}", e);
+                    return;
+                }
             }
         }
+
+        #[cfg(target_os = "macos")]
+        if args.daemon {
+            log::warn!("La modalità daemon non è supportata su macOS. Esecuzione in foreground.");
+        
+        } 
     }
 
     // inizializzo il file system, passando i parametri di configurazione per la cache
@@ -1097,15 +1128,20 @@ fn main() {
         mountpoint, !args.no_cache, args.ttl
     );
 
-    // mount del file system, con le opzioni per il nome del file system, auto unmount e allow other
+    // Opzioni di base per il mount
+    #[allow(unused_mut)]
+    let mut options = vec![
+        MountOption::FSName("remote_fs".to_string()),
+        MountOption::AutoUnmount,
+    ];
+    
+    #[cfg(target_os = "linux")]
+    options.push(MountOption::AllowOther);
+
     if let Err(e) = fuser::mount2(
         fs,
         &mountpoint,
-        &[
-            MountOption::FSName("remote_fs".to_string()),
-            MountOption::AutoUnmount,
-            MountOption::AllowOther,
-        ],
+        &options,
     ) {
         error!("Errore mount: {}", e);
     }
