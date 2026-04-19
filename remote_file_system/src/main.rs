@@ -29,10 +29,10 @@ use crate::{
     file::{OpenFlags, OpenedFile, RfsFile},
 };
 
-// 5 MB Read Ahead
-const PREFETCH_SIZE: u32 = 5 * 1024 * 1024; 
-// 5 MB grandezza del blocco di scrittura, per evitare di tenere in RAM file troppo grandi prima di fare flush sul server
-const CHUNK_SIZE: usize = 5 * 1024 * 1024;
+// mezzo MB Read Ahead
+const PREFETCH_SIZE: u32 = 512 * 1024; 
+// mezzo MB grandezza del blocco di scrittura, per evitare di tenere in RAM file troppo grandi prima di fare flush sul server
+const CHUNK_SIZE: usize = 512 * 1024;
 
 // CLI ARGUMENTS 
 #[derive(Parser, Debug)]
