@@ -1,7 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 use shared::file_entry::FileEntry;
 use crate::{cache::{CachedFile, Inode}, Fd};
-use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenFlags(i32);
@@ -19,7 +18,6 @@ impl OpenFlags {
             Self::READ
         }
     }
-    pub fn is_write(self) -> bool { (self.0 & Self::WRITE.0) != 0 }
 }
 
 #[derive(Debug, Clone)]

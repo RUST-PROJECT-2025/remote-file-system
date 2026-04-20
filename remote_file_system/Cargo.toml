@@ -16,7 +16,6 @@ edition = "2024"
 clap = { version = "4.4", features = ["derive"] } # Parsing argomenti CLI
 lru = "0.12"                                     # Cache LRU
 ctrlc = "3.4"                                    # Gestione segnali (Graceful Shutdown)
-tempfile = "3.8"                                 # Supporto file grandi (buffer su disco)
 
 [target.'cfg(target_os = "linux")'.dependencies]
 daemonize = "0.5"                                # Esecuzione in background

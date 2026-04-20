@@ -17,8 +17,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 use log:: {debug};
-use std::process::Command;
-use std::process::exit;
 
 mod api;
 mod cache;
@@ -229,34 +227,24 @@ impl Filesystem for RemoteFS {
             }
         };
 
-        let target_path = PathBuf::from(&parent_path).join(name.to_string_lossy().as_ref());
+        let target_name = name.to_string_lossy().to_string();
 
-        // Cerchiamo prima nella cache locale
-        let mut found = self
-            .cache
-            .files
-            .iter()
-            .find(|(_, f)| f.file_path == target_path)
-            .map(|(i, f)| (*i, f.clone()));
+        // Cerchiamo prima nella cache locale per path
+        let found_entry = match self.cache.list_dir(&parent_path) {
+            Ok(entries) => {
+                // Cerchiamo il file specificato tra i figli di questa cartella
+                entries.into_iter().find(|e| e.name == target_name)
+            }
+            Err(e) => {
+                debug!("FUSE LOOKUP: Errore list_dir per '{}': {}", parent_path, e);
+                None
+            }
+        };
 
-        // Se non c'è, ALLORA scarichiamo dal server
-        if found.is_none() {
-
-            debug!("FUSE LOOKUP: Cache miss per '{}', forzo list_dir sul server", target_path.display());
-
-            let _ = self.cache.list_dir(&parent_path);
-            found = self
-                .cache
-                .files
-                .iter()
-                .find(|(_, f)| f.file_path == target_path)
-                .map(|(i, f)| (*i, f.clone()));
-        }
-
-        match found {
-            Some((_, f)) => reply.entry(
+        match found_entry {
+            Some(entry) => reply.entry(
                 &self.ttl,
-                &FileAttrWrapper::from(f.file_entry).0,
+                &FileAttrWrapper::from(entry).0,
                 0,
             ),
             None => {
@@ -362,21 +350,23 @@ impl Filesystem for RemoteFS {
                 debug!("FUSE MKDIR: Successo remoto. Risincronizzazione cache per '{}'", parent_path);
 
                 // forza l'aggiornamento della cartella padre per far vedere la nuova directory
-                self.cache.dir_cache.remove(&parent_path);
-                let _ = self.cache.list_dir(&parent_path);
-                let target_path = PathBuf::from(new_path);
+                self.cache.invalidate_dir(&parent_path);
+                let target_name = name.to_string_lossy().to_string();
 
-                let found = self
-                    .cache
-                    .files
-                    .iter()
-                    .find(|(_, f)| f.file_path == target_path)
-                    .map(|(_, f)| f.clone());
+                let found_entry = match self.cache.list_dir(&parent_path) {
+                    Ok(entries) => {
+                        entries.into_iter().find(|e| e.name == target_name)
+                    }
+                    Err(e) => {
+                        error!("FUSE MKDIR: Errore list_dir durante il refresh per '{}': {}", parent_path, e);
+                        None
+                    }
+                };
 
-                match found {
+                match found_entry {
                     Some(f) => reply.entry(
                         &self.ttl,
-                        &FileAttrWrapper::from(f.file_entry).0,
+                        &FileAttrWrapper::from(f).0,
                         0,
                     ),
                     None => {
@@ -428,19 +418,23 @@ impl Filesystem for RemoteFS {
         debug!("FUSE MKNOD: Successo remoto. Sincronizzazione cache per la directory padre");
 
         // forza l'aggiornamento della cartella padre per far vedere il nuovo file
-        self.cache.dir_cache.remove(&parent_path);
-        let _ = self.cache.list_dir(&parent_path);
-        let found = self
-            .cache
-            .files
-            .iter()
-            .find(|(_, f)| f.file_path == new_path)
-            .map(|(_, f)| f.clone());
+        self.cache.invalidate_dir(&parent_path);
+        let target_name = name.to_string_lossy().to_string();
 
-        match found {
+        let found_entry = match self.cache.list_dir(&parent_path) {
+            Ok(entries) => {
+                entries.into_iter().find(|e| e.name == target_name)
+            }
+            Err(e) => { 
+                error!("FUSE MKDIR: Errore list_dir durante il refresh per '{}': {}", parent_path, e);
+                None
+            }
+        };
+
+        match found_entry {
             Some(cached) => reply.entry(
                 &self.ttl,
-                &FileAttrWrapper::from(cached.file_entry).0,
+                &FileAttrWrapper::from(cached).0,
                 0,
             ),
             None => {
@@ -483,15 +477,22 @@ impl Filesystem for RemoteFS {
         debug!("FUSE CREATE: Creazione remota completata. Sincronizzazione cache in corso...");
 
         // aggiorno la cache per far vedere il nuovo file, ricarica la lista per ottenere il nuovo Inode remoto
-        self.cache.dir_cache.remove(&parent_path);
-        let _ = self.cache.list_dir(&parent_path);
+        self.cache.invalidate_dir(&parent_path);
+
+        let target_name = name.to_string_lossy().to_string();
+        
         // cerco il file appena creato nella cache per ottenere i suoi metadati e poterlo aprire subito
-        let found = self
-            .cache
-            .files
-            .iter()
-            .find(|(_, f)| f.file_path == new_path)
-            .map(|(_, f)| f.clone());
+    
+        let found = match self.cache.list_dir(&parent_path) {
+            Ok(entries) => entries.into_iter().find(|e| e.name == target_name).map(|entry| {
+                // Ricostruiamo il CachedFile che il resto della funzione si aspetta
+                crate::cache::CachedFile {
+                    file_entry: entry,
+                    file_path: new_path.clone(),
+                }
+            }),
+            Err(_) => None,
+        };
 
         match found {
             // se trovo il file lo apro
@@ -548,18 +549,20 @@ impl Filesystem for RemoteFS {
         };
         let target_path = PathBuf::from(&parent_path).join(name);
         let target_path_str = target_path.to_string_lossy().to_string();
+        let target_name = name.to_string_lossy().to_string();
 
-        let found_entry = self
-            .cache
-            .files
-            .iter()
-            .find(|(_, f)| f.file_path == target_path)
-            .map(|(_, f)| f.clone());
+        // cerco Inode del file interrogando solo i figli della cartella padre
+        let found_inode = match self.cache.list_dir(&parent_path) {
+            Ok(entries) => entries.into_iter().find(|e| e.name == target_name).map(|e| Inode(e.ino)),
+            Err(e) => {
+                debug!("FUSE UNLINK: Errore list_dir per '{}': {}", parent_path, e);
+                None
+            }
+        };
 
         // controllo se l'Inode si trova nella mappa dei file aperti
         // e se ha almeno un fd "attivo"
-        if let Some(cached) = found_entry.clone() {
-            let inode = Inode(cached.file_entry.ino);
+        if let Some(inode) = found_inode{
 
             let is_open = if let Some(rfs_file) = self.rfs_files.get(&inode) {
                 !rfs_file.fds.is_empty()
@@ -603,9 +606,9 @@ impl Filesystem for RemoteFS {
         match self.cache.api.delete_file_or_directory(&target_path_str) {
             Ok(_) => {
                 // rimuovi dalla cache locale dei file
-                if let Some(cached) = found_entry {
-                    debug!("FUSE UNLINK: Rimozione Inode {} dalla cache LRU", cached.file_entry.ino);
-                    self.cache.files.pop(&Inode(cached.file_entry.ino));
+                if let Some(inode) = found_inode {
+                    debug!("FUSE UNLINK: Rimozione Inode {} dalla cache LRU", inode.0);
+                    self.cache.files.pop(&inode);
                 }
                 // invalido la cache della directory padre
                 self.cache.invalidate_dir(&parent_path);
@@ -630,21 +633,24 @@ impl Filesystem for RemoteFS {
         };
         let target_path = PathBuf::from(&parent_path).join(name);
         let target = target_path.to_string_lossy().to_string();
+        let target_name = name.to_string_lossy().to_string();
 
         info!("FUSE RMDIR: Eliminazione directory '{}'", target);
 
+        // cerco Inode della directory interrogando solo i figli della cartella padre
+        let found_inode = match self.cache.list_dir(&parent_path) {
+            Ok(entries) => entries.into_iter().find(|e| e.name == target_name).map(|e| Inode(e.ino)),
+            Err(e) => {
+                debug!("FUSE RMDIR: Errore list_dir per '{}': {}", parent_path, e);
+                None
+            }
+        };
         // cancella la directory solo se è vuota (controllo gestito nel backend), altrimenti ritorna ENOTEMPTY
         match self.cache.api.delete_file_or_directory(&target) {
             Ok(_) => {
                 // rimuovi la directory eliminata dalla cache locale
-                let found = self
-                    .cache
-                    .files
-                    .iter()
-                    .find(|(_, f)| f.file_path == target_path)
-                    .map(|(i, _)| *i);
-
-                if let Some(ino) = found {
+        
+                if let Some(ino) = found_inode {
                     debug!("FUSE RMDIR: Rimozione Inode {} (directory) dalla cache LRU", ino.0);
                     self.cache.files.pop(&ino);
                 }
@@ -688,6 +694,7 @@ impl Filesystem for RemoteFS {
             }
         };
 
+        let target_name = name.to_string_lossy().to_string();
         let old_path = PathBuf::from(&parent_path)
             .join(name)
             .to_string_lossy()
@@ -700,22 +707,21 @@ impl Filesystem for RemoteFS {
             new_name_str = format!("/{}", new_name_str);
         }
 
+        // cerco Inode del file interrogando solo i figli della cartella padre
+        let found_inode = match self.cache.list_dir(&parent_path) {
+            Ok(entries) => entries.into_iter().find(|e| e.name == target_name).map(|e| Inode(e.ino)),
+            Err(e) => {
+                debug!("FUSE RENAME: Errore list_dir per '{}': {}", parent_path, e);
+                None
+            }
+        };
+
         info!("FUSE RENAME: '{}' -> '{}'", old_path, new_full_path.display());
         // passiamo new_name_str all'API
         match self.cache.api.rename(&old_path, &new_name_str) {
             Ok(_) => {
                 // se l'operazione di rename è andata a buon fine, aggiorniamo la cache locale per riflettere il cambiamento
-                let target_path = PathBuf::from(&parent_path).join(name);
-
-                // cerchiamo il vecchio file in cache
-                let found = self
-                    .cache
-                    .files
-                    .iter()
-                    .find(|(_, f)| f.file_path == target_path)
-                    .map(|(i, _)| *i);
-
-                if let Some(ino) = found {
+                if let Some(ino) = found_inode {
                     debug!("FUSE RENAME: Rimozione vecchio percorso dalla cache LRU (Inode {})", ino.0);
                     // rimuoviamo dai metadati cache
                     self.cache.files.pop(&ino);
@@ -814,7 +820,7 @@ impl Filesystem for RemoteFS {
             }
         }
 
-        // se il file non è stato modificato localmente, o non ha un buffer di scrittura, procedo con la lettura normale
+        // se il file non è stato modificato localmente, procedo con la lettura normale
         let rfs_file = match self.rfs_files.get_mut(&inode) {
             Some(f) => f,
             None => {

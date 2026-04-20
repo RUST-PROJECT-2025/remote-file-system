@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::MetadataExt;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
